@@ -107,7 +107,9 @@ typedef struct {
     uint32_t cons_bytes;       /* CUMULATIVE bytes consumed since the last reload */
     uint8_t  sync_cnt;         /* CUMULATIVE decoded-frame count (8-bit, wraps) */
     uint8_t  idle_cnt;         /* CUMULATIVE no-frame-decode count */
-    uint16_t ctrl_flags;
+    uint16_t ctrl_flags;       /* what we PUSH down (CMD_573_CTRL w2) */
+    uint8_t  ddrsbm_want;      /* OUR intent for the scheme -- see set_ctrl */
+    uint8_t  ddrsbm_echo_bad;  /* the fabric disagreed with us (should be 0) */
 
     /* --- observability --- */
     uint32_t frames;
@@ -122,9 +124,22 @@ void s573_core_init(s573_core_t *c);
  * also re-init their MP3 decoder. */
 void s573_core_on_reset(s573_core_t *c, uint16_t new_rst_epoch);
 
+/* Set what we push down in CMD_573_CTRL w2.
+ *
+ * THE DESCRAMBLE SCHEME IS OURS TO CHOOSE, NOT THE FABRIC'S TO TELL US (open
+ * decision C: the HPS knows which game is mounted). emu.sv feeds our ctrl_flags
+ * bit0 into k573dio's cfg_ddrsbm, and CMD_573_MP3CFG word8 reports that same bit
+ * back up -- so the config word is an ECHO of our own setting, not a source. A
+ * caller that took the scheme from the echo would read 0 before we had set
+ * anything, silently descramble ddrsbm with the DEFAULT scheme, and never
+ * re-adopt. So: set it here, and changing it forces the config to be re-read. */
+void s573_core_set_ctrl(s573_core_t *c, uint16_t flags);
+
 /* Adopt a freshly-read CMD_573_MP3CFG tuple. Re-arms the descrambler and zeroes
  * the consumption counter, because the fabric zeroes its own baseline on the
- * same re-arm. */
+ * same re-arm. Uses OUR ddrsbm intent for the scheme and only CHECKS the echo --
+ * a mismatch sets ddrsbm_echo_bad, which means the fabric is descrambling
+ * differently than we are and the audio will be noise. */
 void s573_core_apply_cfg(s573_core_t *c, const s573_cfg_t *cfg);
 
 /* Free space in the PCM ring, in beats, leaving one beat so full != empty. */

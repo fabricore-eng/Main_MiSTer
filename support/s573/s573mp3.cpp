@@ -51,9 +51,8 @@ extern "C" {
 #include "../../lib/minimp3/minimp3.h"
 
 // One MPEG-1 Layer III frame is 1152 samples; stereo int16 => 4608 bytes.
-// The fabric ring counts 8-byte beats (2 stereo frames each).
-#define PCM_BYTES_PER_FRAME  (MINIMP3_MAX_SAMPLES_PER_FRAME * 2)
-#define BEATS_PER_FRAME      (1152u * 2u * 2u / 8u)   // 576
+// The fabric ring counts 8-byte beats (2 stereo frames each), so 576 per frame.
+#define BEATS_PER_FRAME      (1152u * 2u * 2u / 8u)
 
 static struct
 {
@@ -181,8 +180,10 @@ void s573mp3_poll()
 	//    until the reset epoch is acked, which is exactly what we want.
 	struct ptrs_reply r;
 	__sync_synchronize();          // our PCM stores land before we advertise them
-	ext_ptrs(c->pcm_wr, s573_core_credit_word(c),
-	         c->rst_acked ? c->rst_epoch : c->rst_epoch, &r);
+	// rst_ack always carries the epoch we last saw: if it matches the fabric's,
+	// the pointer words apply; if it does not, the fabric ignores them and we
+	// re-ack below. Same word either way -- no branch needed.
+	ext_ptrs(c->pcm_wr, s573_core_credit_word(c), c->rst_epoch, &r);
 	c->pcm_rd = r.fab_pcm_rd;
 
 	// 2. reset handling. The core-load reset bumps rst_epoch too, so this fires
@@ -207,6 +208,12 @@ void s573mp3_poll()
 	if (!s573.adopted_baselines)
 	{
 		uint16_t base = 0;
+		// TODO(decision C): the scheme is OURS to choose and must be set BEFORE
+		// the first config adoption, or we descramble ddrsbm with the default
+		// schedule and produce noise. Nothing determines the mounted game yet,
+		// so this is hardcoded off and ddrsbm WILL NOT PLAY CORRECTLY until a
+		// per-game source exists. Loud comment rather than a silent default.
+		s573_core_set_ctrl(c, S573_CTRL_DRAIN_EN /* | S573_CTRL_DDRSBM */);
 		ext_ctrl(0, c->ctrl_flags, &base);
 		c->sync_cnt = (uint8_t)(base >> 8);
 		c->idle_cnt = (uint8_t)(base & 0xFF);

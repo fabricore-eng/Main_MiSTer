@@ -29,14 +29,30 @@ void s573_core_on_reset(s573_core_t *c, uint16_t new_rst_epoch)
      * with a stale key schedule is silent noise, not an error. */
 }
 
+void s573_core_set_ctrl(s573_core_t *c, uint16_t flags)
+{
+    uint8_t want = (flags & S573_CTRL_DDRSBM) ? 1 : 0;
+    if (want != c->ddrsbm_want) {
+        c->ddrsbm_want = want;
+        c->have_cfg    = 0;    /* force a re-adopt: the schedule depends on it */
+    }
+    c->ctrl_flags = flags;
+}
+
 void s573_core_apply_cfg(s573_core_t *c, const s573_cfg_t *cfg)
 {
     uint32_t start = ((uint32_t)cfg->start_hi << 16) | cfg->start_lo;
     uint32_t end   = ((uint32_t)cfg->end_hi   << 16) | cfg->end_lo;
+    uint8_t  echo  = (cfg->flags & S573_CTRL_DDRSBM) ? 1 : 0;
+
+    /* OUR intent decides. The config word only confirms the fabric agrees --
+     * if it does not, the two sides are descrambling differently and the audio
+     * is noise, so make it visible rather than silently following the echo. */
+    c->ddrsbm_echo_bad = (echo != c->ddrsbm_want);
 
     s573_desc_init(&c->desc, start, end,
                    cfg->key1, cfg->key2, cfg->key3,
-                   (cfg->flags & S573_CTRL_DDRSBM) ? 1 : 0);
+                   c->ddrsbm_want);
 
     c->in_len   = 0;
     c->in_pos   = 0;
