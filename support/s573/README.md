@@ -56,12 +56,16 @@ fabric owns it. `s573_desc_has_data()` is deliberately *not* that bit.
 
 ## Still to do
 
-- [ ] **Vendor minimp3** as `lib/minimp3/minimp3.h` (single header,
-      `MINIMP3_IMPLEMENTATION`, same style as `lib/libchdr`). Not done yet —
-      deliberately left as an explicit step rather than pulling code down unattended.
-      `s573mp3.cpp` already includes it and will not compile until it lands.
-- [ ] **Build for ARM.** No cross-compiler on the dev Mac; use the MiSTer build
-      container or `dell`.
+- [x] **Vendor minimp3** — `lib/minimp3/minimp3.h`, 76,831 bytes, sha256
+      `57e437c5c1f0e8b243885d3929c8973b5e6c778451e0100ab4251d19915cb3ad`, from
+      github.com/lieff/minimp3 (CC0 public domain, GPL-compatible).
+- [x] **`s573mp3.cpp` compiles** — host-compiled clean under `-Wall -Wextra` against
+      stubbed MiSTer headers (a mutation confirmed the check is real). It has NOT been
+      compiled for ARM or linked into Main.
+- [ ] **Build for ARM.** `arm-none-linux-gnueabihf` (per the top-level Makefile) is
+      installed on neither the dev Mac nor `dell` — dell has only the Quartus image.
+      Needs a toolchain decision: install on dell, use a cross-compile container, or
+      build on the MiSTer itself.
 - [ ] Extend the core repo's `tools/mister_load.sh` to scp this binary alongside the
       `.rbf` (Decision A: accepted 2026-07-29).
 - [ ] `ctrl_flags` — nothing sets `S573_CTRL_DRAIN_EN` or the per-game `ddrsbm` bit

@@ -62,6 +62,8 @@ static struct
 	volatile uint8_t *dio;     // scrambled source window (read-only for us)
 	volatile uint8_t *pcm;     // PCM ring (write-only for us)
 	int              adopted_baselines;
+	int              warned_mono;
+	int              warned_rate;
 	uint32_t         last_poll;
 } s573;
 
@@ -117,10 +119,9 @@ static void ext_read_cfg(s573_cfg_t *c)
 // mapping is uncached (/dev/mem O_SYNC), so this is a straight store loop; a
 // memcpy into it is fine but must not be re-ordered past the SPI exchange that
 // advertises the new write pointer -- hence the barrier in the caller.
-static void pcm_write(const int16_t *pcm, uint32_t frames)
+static void pcm_write(const int16_t *pcm, uint32_t bytes)
 {
 	uint32_t byte_off = (uint32_t)s573.core.pcm_wr * 8u;
-	uint32_t bytes    = frames * 4u;            // 2ch * int16
 	const uint8_t *src = (const uint8_t *)pcm;
 
 	while (bytes)
@@ -250,8 +251,40 @@ void s573mp3_poll()
 
 		if (samples > 0)
 		{
-			pcm_write(pcm, (uint32_t)samples);
-			s573_core_wrote_pcm(c, (uint16_t)((uint32_t)samples * 4u / 8u));
+			// minimp3 returns samples PER CHANNEL and fills samples*channels
+			// values. The fabric ring is interleaved stereo, so a MONO frame
+			// must be expanded -- writing it raw would put half the data in and
+			// desync the ring against the 44100 Hz drain, which is silent
+			// corruption, not an error. 573 audio should always be stereo; if
+			// it is not, say so once and still play it correctly.
+			uint32_t bytes;
+			if (info.channels == 2)
+			{
+				bytes = (uint32_t)samples * 4u;
+				pcm_write(pcm, bytes);
+			}
+			else if (info.channels == 1)
+			{
+				static short st[MINIMP3_MAX_SAMPLES_PER_FRAME];
+				for (int i = 0; i < samples; i++) { st[2*i] = pcm[i]; st[2*i+1] = pcm[i]; }
+				bytes = (uint32_t)samples * 4u;
+				pcm_write(st, bytes);
+				if (!s573.warned_mono) { printf("s573mp3: MONO frame (%d ch) -- expanding to stereo\n", info.channels); s573.warned_mono = 1; }
+			}
+			else
+			{
+				if (!s573.warned_mono) { printf("s573mp3: unexpected channel count %d -- dropping frame\n", info.channels); s573.warned_mono = 1; }
+				continue;
+			}
+			// The fabric drains at a hard 44100 Hz. A different sample rate is
+			// not something we can resample here -- it would simply play at the
+			// wrong speed, and the chart would drift against the music.
+			if (info.hz != 44100 && !s573.warned_rate)
+			{
+				printf("s573mp3: WARNING sample rate %d Hz, fabric drains at 44100 -- audio will play at the wrong speed\n", info.hz);
+				s573.warned_rate = 1;
+			}
+			s573_core_wrote_pcm(c, (uint16_t)(bytes / 8u));
 			produced = 1;
 		}
 	}
