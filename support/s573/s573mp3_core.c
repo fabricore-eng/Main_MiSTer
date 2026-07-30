@@ -31,24 +31,23 @@ void s573_core_on_reset(s573_core_t *c, uint16_t new_rst_epoch)
 
 void s573_core_set_ctrl(s573_core_t *c, uint16_t flags)
 {
-    uint8_t want = (flags & S573_CTRL_DDRSBM) ? 1 : 0;
-    if (want != c->ddrsbm_want) {
-        c->ddrsbm_want = want;
-        c->have_cfg    = 0;    /* force a re-adopt: the schedule depends on it */
-    }
-    c->ctrl_flags = flags;
+    /* bit0 is RESERVED: the descramble scheme is owned by the fabric's OSD bit
+     * (emu.sv O[101]) and arrives in the MP3CFG word, not from us. */
+    c->ctrl_flags = (uint16_t)(flags & (uint16_t)~S573_CTRL_DDRSBM);
 }
 
 void s573_core_apply_cfg(s573_core_t *c, const s573_cfg_t *cfg)
 {
     uint32_t start = ((uint32_t)cfg->start_hi << 16) | cfg->start_lo;
     uint32_t end   = ((uint32_t)cfg->end_hi   << 16) | cfg->end_lo;
-    uint8_t  echo  = (cfg->flags & S573_CTRL_DDRSBM) ? 1 : 0;
-
-    /* OUR intent decides. The config word only confirms the fabric agrees --
-     * if it does not, the two sides are descrambling differently and the audio
-     * is noise, so make it visible rather than silently following the echo. */
-    c->ddrsbm_echo_bad = (echo != c->ddrsbm_want);
+    /* The scheme is the FABRIC's to state, not ours to guess: it comes from the
+     * OSD bit O[101], which k573dio also folds into cfg_epoch -- so a mid-game
+     * toggle re-triggers this adoption instead of silently leaving us on the old
+     * key schedule. (Earlier this read back a bit WE had set, which made the
+     * config word an echo of ourselves and defaulted ddrsbm titles to the wrong
+     * scheme; the OSD bit removed that circularity.) */
+    c->ddrsbm_want     = (cfg->flags & S573_CTRL_DDRSBM) ? 1 : 0;
+    c->ddrsbm_echo_bad = 0;
 
     s573_desc_init(&c->desc, start, end,
                    cfg->key1, cfg->key2, cfg->key3,

@@ -136,10 +136,8 @@ int main(void)
     s573_core_apply_cfg(&c, &cfg);
     CHK(c.cons_bytes == 0, "T5: credit not rebaselined on the new song");
     CHK(c.in_len == 0 && c.in_pos == 0, "T5: stale staged bytes survived the re-arm");
-    /* the echo says scheme 1, but OUR intent is still 0 -- intent wins, and the
-     * disagreement is surfaced rather than silently followed (see T9) */
-    CHK(c.desc.ddrsbm == 0, "T5: the echo must not override our intent");
-    CHK(c.ddrsbm_echo_bad, "T5: a disagreeing echo must be flagged");
+    /* the fabric states scheme 1 for this song, so we adopt it (see T9) */
+    CHK(c.desc.ddrsbm == 1, "T5: scheme not adopted from the fabric config");
     CHK(c.cfg_epoch == 6, "T5: cfg epoch not adopted");
 
     /* ---- T6: a reset wipes everything and re-closes the gate ---- */
@@ -166,25 +164,22 @@ int main(void)
     for (n = 0; n < S573_PCM_BEATS + 17; n++) s573_core_wrote_pcm(&c, 1);
     CHK(c.pcm_wr == 17, "T8: pcm_wr should wrap to 17, got %u", c.pcm_wr);
 
-    /* ---- T9: the descramble scheme is OURS, the config word is only an echo ----
-     * A caller that trusted the echo would read 0 before we had set anything,
-     * descramble ddrsbm with the default scheme, and never re-adopt. */
+    /* ---- T9: the descramble scheme comes FROM the fabric (OSD bit O[101]) ----
+     * We must not set it ourselves and must not ignore it. k573dio folds the OSD
+     * bit into cfg_epoch, so a mid-game toggle re-triggers adoption here. */
     s573_core_init(&c);
     c.rst_acked = 1;
     s573_core_set_ctrl(&c, S573_CTRL_DRAIN_EN | S573_CTRL_DDRSBM);
-    CHK(c.ddrsbm_want == 1, "T9: ddrsbm intent not recorded");
-    cfg = mkcfg(0x100, 0x400, 9, 0);          /* fabric echo says 0 -- stale */
+    CHK(!(c.ctrl_flags & S573_CTRL_DDRSBM),
+        "T9: we must NOT push the scheme down -- bit0 is the fabric's");
+    CHK(c.ctrl_flags & S573_CTRL_DRAIN_EN, "T9: other ctrl bits must survive");
+
+    cfg = mkcfg(0x100, 0x400, 9, 1);          /* fabric says: variant scheme */
     s573_core_apply_cfg(&c, &cfg);
-    CHK(c.desc.ddrsbm == 1, "T9: our intent must win over a stale echo");
-    CHK(c.ddrsbm_echo_bad, "T9: a disagreeing echo must be flagged, not followed");
-    cfg = mkcfg(0x100, 0x400, 10, 1);         /* fabric now agrees */
+    CHK(c.desc.ddrsbm == 1, "T9: must adopt the scheme the fabric states");
+    cfg = mkcfg(0x100, 0x400, 10, 0);         /* OSD toggled back mid-game */
     s573_core_apply_cfg(&c, &cfg);
-    CHK(c.desc.ddrsbm == 1 && !c.ddrsbm_echo_bad, "T9: agreeing echo clears the flag");
-    /* flipping the scheme must force a re-adopt, or the key schedule stays wrong */
-    c.have_cfg = 1;
-    s573_core_set_ctrl(&c, S573_CTRL_DRAIN_EN);
-    CHK(!c.have_cfg, "T9: flipping ddrsbm must force a config re-read");
-    CHK(!s573_core_should_decode(&c, 1), "T9: must not decode with a stale scheme");
+    CHK(c.desc.ddrsbm == 0, "T9: must re-adopt when the fabric changes it");
 
     if (!fails) printf("RESULT: PASS (s573mp3_core, 9 groups)\n");
     else        printf("RESULT: FAIL (s573mp3_core, %d checks failed)\n", fails);
