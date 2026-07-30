@@ -1,0 +1,24 @@
+# MiSTer Main_MiSTer ARM cross-compile image.
+#
+# Pins the EXACT toolchain the upstream Makefile names ("using gcc version 10.2.1",
+# BASE = arm-none-linux-gnueabihf) -- the ARM GNU Toolchain 10.2-2020.11, not
+# Debian's gcc-arm-linux-gnueabihf. That matters: MiSTer's rootfs is an older
+# userland, and a newer distro toolchain can emit binaries needing a glibc the
+# board does not have. Matching upstream removes that whole class of surprise.
+#
+# All of Main's libraries are vendored (lib/imlib2, lib/bluetooth), so nothing
+# else is needed at build time.
+FROM debian:bullseye-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        make xz-utils ca-certificates curl file \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TC=gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf
+RUN curl -fsSL "https://developer.arm.com/-/media/Files/downloads/gnu-a/10.2-2020.11/binrel/${TC}.tar.xz" \
+      -o /tmp/tc.tar.xz \
+ && tar -xJf /tmp/tc.tar.xz -C /opt \
+ && rm /tmp/tc.tar.xz
+
+ENV PATH="/opt/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf/bin:${PATH}"
+WORKDIR /work
