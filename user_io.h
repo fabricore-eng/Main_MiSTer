@@ -278,6 +278,7 @@ char is_sgb();
 char is_neogeo();
 char is_neogeo_cd();
 char is_megacd();
+char is_573();
 char is_pce();
 char is_archie();
 char is_gba();

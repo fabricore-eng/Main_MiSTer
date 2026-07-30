@@ -36,6 +36,7 @@ C_SRC =   $(wildcard *.c) \
 					$(wildcard ./lib/zstd/lib/common/*.c) \
 					$(wildcard ./lib/zstd/lib/decompress/*.c) \
           $(wildcard ./lib/libchdr/*.c) \
+          $(wildcard ./support/*/*.c) \
           lib/libco/arm.c
 
 CPP_SRC = $(wildcard *.cpp) \

@@ -281,6 +281,17 @@ char is_megacd()
 	return (is_megacd_type == 1);
 }
 
+// Konami System 573. PREFIX match, not exact: the rbf can carry a date/variant
+// suffix, and a gate that silently never fires is design risk #6 (a stale forked
+// binary quietly disabling MP3) -- the failure mode is no audio and no error.
+static int is_573_type = 0;
+char is_573()
+{
+	if (!is_573_type)
+		is_573_type = strncasecmp(orig_name, "Konami_System_573", 17) ? 2 : 1;
+	return (is_573_type == 1);
+}
+
 static int is_pce_type = 0;
 char is_pce()
 {
@@ -429,6 +440,7 @@ void user_io_read_core_name()
 	is_neogeo_type = 0;
 	is_minimig_type = 0;
 	is_megacd_type = 0;
+	is_573_type = 0;
 	is_pce_type = 0;
 	is_archie_type = 0;
 	is_gba_type = 0;
@@ -3184,6 +3196,7 @@ void user_io_poll()
 		if (is_st()) tos_poll();
 		if (is_snes() || is_sgb()) snes_poll();
 		mdplus_poll(); // MD+ CDDA poll
+		s573mp3_poll(); // System 573 Digital I/O MP3 decode service
 
 		for (int i = 0; i < 4; i++)
 		{

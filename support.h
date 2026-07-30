@@ -27,6 +27,9 @@
 // MegaDrive  support
 #include "support/megadrive/mdplus.h"
 
+// Konami System 573 (Digital I/O MP3 service)
+#include "support/s573/s573mp3.h"
+
 // N64  support
 #include "support/n64/n64.h"
 #include "support/n64/n64_joy_emu.h"
