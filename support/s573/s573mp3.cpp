@@ -365,16 +365,34 @@ void s573mp3_poll()
 	}
 	if (!produced) s573_core_note_idle(c);
 
-	// 5b. SONG END. The drain must NOT be ended by fpga_ctrl[14:13]: ddrsbm asserts
-	//     both enables once and never clears them again (measured on hardware
-	//     2026-07-31 -- every config adoption after the first song reads
-	//     flags=000f while start/end are rewritten per song). Treat the enable as
-	//     a START gate only, and end on the honest signal instead: the descrambled
+	// 5b. SONG END -- a SECOND end condition, not the only one.
+	//
+	//     CORRECTION 2026-07-31 (later the same day): the claim that used to sit
+	//     here -- "ddrsbm asserts both enables once and never clears them again,
+	//     every config adoption reads flags=000f" -- is FALSE. It came from a
+	//     16-sample window that happened to fall entirely inside playback. A full
+	//     13-hour board log says the opposite:
+	//         flags=000f (stream_en=1)  1,828,242
+	//         flags=000b (stream_en=0)    846,906
+	//     and the drain does follow it -- 2,170 heartbeats show ctrl=0000 with
+	//     frames>0, i.e. drain OFF after decoding had started. MAME agrees: every
+	//     playback stop is fpga_ctrl bit14 going low (bit13 MP3_ENABLE, bit14
+	//     STREAMING_ENABLE, per k573fpga.h and rtl/k573_mp3stream.v:140).
+	//
+	//     So apply_cfg's enable-driven stop in s573mp3_core.c:58 IS the primary
+	//     path and it works. This block stays as a backstop for the case where the
+	//     window runs out without the game clearing the enables: the descrambled
 	//     window is exhausted (cur >= mp3_end -- the same bound the fabric's own
 	//     stream_en uses) AND everything we decoded has been drained. Waiting for
 	//     the ring to empty lets the tail play out instead of truncating it.
-	//     Without this the music simply never stops: it plays through menus until
-	//     some later song happens to re-arm the window.
+	//
+	//     STILL OPEN: the reported "music keeps playing when a stage is FAILED".
+	//     Neither path above has been shown to miss that case; the remaining
+	//     suspect is the MAS3507D output gain matrix (I2C bank1 0x7f8..0x7fb,
+	//     zero = mute), which rtl/mas3507d_i2c.v ACKs and DROPS -- so if the game
+	//     silences a failed stage by muting the decoder rather than by clearing
+	//     the enables, we would never see it. Unconfirmed: reach a real failed
+	//     stage in the MAME oracle and check which of the two the game uses.
 	if ((c->ctrl_flags & S573_CTRL_DRAIN_EN)
 	    && c->desc.cur >= c->desc.mp3_end
 	    && c->pcm_wr == c->pcm_rd)
