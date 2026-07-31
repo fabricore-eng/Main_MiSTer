@@ -2,6 +2,7 @@
  * s573mp3_core.c - System 573 MP3 service, pure logic half. See the header.
  * Released under the GNU GPL v2.
  * ---------------------------------------------------------------------------- */
+#include <math.h>
 #include "s573mp3_core.h"
 
 static void zero(void *p, size_t n)
@@ -140,4 +141,12 @@ uint16_t s573_core_ctrl_events(const s573_core_t *c)
 uint16_t s573_core_credit_word(const s573_core_t *c)
 {
     return (uint16_t)(c->cons_bytes & 0xFFFFu);
+}
+
+float s573_core_gain_mult(uint32_t v)
+{
+    double db;
+    if (v == 0) return 0.0f;                 /* MAME's explicit mute case */
+    db = round(20.0 * log10(((double)0x100000 - (double)v) / (double)0x80000));
+    return (float)pow(10.0, (db + 6.0) / 20.0);
 }

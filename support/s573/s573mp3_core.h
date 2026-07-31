@@ -82,11 +82,29 @@ extern "C" {
 #define S573_CFG_MP3_ENABLE    (1u << (S573_CFG_FPGA_EN_SHIFT + 0))  /* fpga_ctrl[13] */
 #define S573_CFG_STREAM_ENABLE (1u << (S573_CFG_FPGA_EN_SHIFT + 1))  /* fpga_ctrl[14] */
 
+/* MAS3507D output-gain curve, MAME mas3507d verbatim:
+ *   gain_to_db(v) = round(20*log10((0x100000 - v)/0x80000))
+ *   mult(v)       = v == 0 ? 0 : 10^((db + 6)/20)
+ * Lives here (not in s573mp3.cpp) so it is host-testable: the .cpp pulls in
+ * MiSTer/Linux headers that will not compile on a dev Mac.
+ * NOTE: ddrsbm asks for 0xAF3CD = -4 dB = x1.2589, a BOOST. Unity is near
+ * 0xBFBDE. This is NOT a fix for the clipping -- see s573mp3.cpp. */
+float s573_core_gain_mult(uint32_t v);
+
 typedef struct {
     uint16_t start_lo, start_hi, end_lo, end_hi;
     uint16_t key1, key2, key3;
     uint16_t flags;            /* bit0 ddrsbm, bits3:1 fpga_ctrl[15:13] */
     uint16_t epoch;
+    /* MAS3507D output gain matrix, decoded off the I2C bus by the fabric.
+     * The GAME's own output level; 0 means mute. We used to drop these
+     * entirely and play at unity, which is why silicon measured peak
+     * 0.000265 dBFS -- pinned to digital full scale.
+     * gain_seen is sticky: 0 = the game has never set a level, so apply
+     * unity rather than booting muted. */
+    uint32_t gain_ll;          /* 20-bit */
+    uint32_t gain_rr;          /* 20-bit */
+    int      gain_seen;
 } s573_cfg_t;
 
 typedef struct {

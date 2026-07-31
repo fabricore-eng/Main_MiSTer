@@ -69,6 +69,8 @@ static struct
 	int              tone_en;      // S573MP3_TONE=1: substitute a generated sine
 	int              tone_ph;      // sine phase, samples mod 44100
 	int              hb_en;        // S573MP3_HB=1: periodic state line
+	float            gain_l;       // MAS3507D output gain, applied to decoded PCM
+	float            gain_r;       // (1.0 until the game sets one -- never boot muted)
 	uint32_t         last_hb;
 } s573;
 
@@ -116,7 +118,52 @@ static void ext_read_cfg(s573_cfg_t *c)
 	c->key2     = spi_w(0);
 	c->key3     = spi_w(0);
 	c->flags    = spi_w(0);
+	uint16_t g_ll_lo = spi_w(0);
+	uint16_t g_rr_lo = spi_w(0);
+	uint16_t g_hi    = spi_w(0);   /* {7'd0, gain_seen, rr[19:16], ll[19:16]} */
+	c->gain_ll   = ((uint32_t)(g_hi & 0x000f) << 16) | g_ll_lo;
+	c->gain_rr   = ((uint32_t)((g_hi >> 4) & 0x000f) << 16) | g_rr_lo;
+	c->gain_seen = (g_hi >> 8) & 1;
 	DisableIO();
+}
+
+
+// ---- MAS3507D output gain -----------------------------------------------------
+// The game sets its own output level in the decoder's gain matrix and MUTES by
+// writing zeros. The fabric decodes those writes (rtl/mas3507d_i2c.v) and hands
+// them over on CMD_573_MP3CFG; we apply them here because our decode is host-side
+// and there is no MAS3507D chip to apply them for us.
+//
+// Curve is MAME's mas3507d verbatim:
+//     gain_to_db(v)  = round(20 * log10((0x100000 - v) / 0x80000))
+//     percentage(v)  = v == 0 ? 0 : 10 ^ ((db + 6) / 20)
+//
+// NOTE, MEASURED 2026-07-31 -- this is NOT the clipping fix, and expecting it to
+// be was wrong. ddrsbm asks for 0xAF3CD, which is -4 dB on that curve and so a
+// multiplier of 1.2589 -- a BOOST. Unity sits near 0xBFBDE. Applying the game's
+// gain faithfully therefore makes us ~2 dB LOUDER, not quieter, so it can only
+// worsen the peak-pinned-at-0-dBFS measured on silicon. The clipping is a
+// headroom problem in our SPU+MP3 mix budget and needs its own fix.
+//
+// What this DOES buy: correct level relative to the game's intent, and the mute
+// (v == 0), which is real -- the game issues it at song end and on a failed stage.
+// gain_seen == 0 means the game has never set a level, so apply unity rather than
+// booting muted.
+
+// Scale in place with saturation. Saturating (not wrapping) matters: a wrap turns
+// a loud passage into buzzing garbage, which is far worse than a clipped peak.
+static void s573_apply_gain(int16_t *pcm, int samples_stereo, float gl, float gr)
+{
+	if (gl == 1.0f && gr == 1.0f) return;
+	for (int i = 0; i < samples_stereo; i++)
+	{
+		float l = (float)pcm[2*i]     * gl;
+		float r = (float)pcm[2*i + 1] * gr;
+		if (l >  32767.0f) l =  32767.0f; else if (l < -32768.0f) l = -32768.0f;
+		if (r >  32767.0f) r =  32767.0f; else if (r < -32768.0f) r = -32768.0f;
+		pcm[2*i]     = (int16_t)l;
+		pcm[2*i + 1] = (int16_t)r;
+	}
 }
 
 // ---- PCM ring ----------------------------------------------------------------
@@ -260,6 +307,9 @@ void s573mp3_poll()
 		s573_cfg_t cfg;
 		ext_read_cfg(&cfg);
 		s573_core_apply_cfg(c, &cfg);
+		// gain_seen == 0: the game has not set a level yet -> unity, NOT mute.
+		s573.gain_l = cfg.gain_seen ? s573_core_gain_mult(cfg.gain_ll) : 1.0f;
+		s573.gain_r = cfg.gain_seen ? s573_core_gain_mult(cfg.gain_rr) : 1.0f;
 		// The drain is derived from flags bits MP3_ENABLE/STREAM_ENABLE (fabric
 		// fpga_ctrl[14:13]). If those never clear, the drain never clears and the
 		// music plays on past the game's stop -- so log the RAW flags on every
@@ -336,6 +386,7 @@ void s573mp3_poll()
 			if (info.channels == 2)
 			{
 				bytes = (uint32_t)samples * 4u;
+				s573_apply_gain(pcm, samples, s573.gain_l, s573.gain_r);
 				pcm_write(pcm, bytes);
 			}
 			else if (info.channels == 1)
@@ -343,6 +394,7 @@ void s573mp3_poll()
 				static short st[MINIMP3_MAX_SAMPLES_PER_FRAME];
 				for (int i = 0; i < samples; i++) { st[2*i] = pcm[i]; st[2*i+1] = pcm[i]; }
 				bytes = (uint32_t)samples * 4u;
+				s573_apply_gain(st, samples, s573.gain_l, s573.gain_r);
 				pcm_write(st, bytes);
 				if (!s573.warned_mono) { printf("s573mp3: MONO frame (%d ch) -- expanding to stereo\n", info.channels); s573.warned_mono = 1; }
 			}

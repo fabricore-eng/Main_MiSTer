@@ -205,7 +205,34 @@ int main(void)
     s573_core_apply_cfg(&c, &cfg);
     CHK(c.ctrl_flags & S573_CTRL_DRAIN_EN, "T10: drain must come back on replay");
 
-    if (!fails) printf("RESULT: PASS (s573mp3_core, 10 groups)\n");
+    /* ---- group 11: MAS3507D output gain curve (MAME mas3507d verbatim) ----
+     * The value that matters is the one ddrsbm actually sends, captured off the
+     * MAME oracle: 0xAF3CD. It is a BOOST (x1.2589), which is why applying the
+     * game's gain is NOT a fix for the measured clipping. Pin the curve so that
+     * conclusion cannot silently rot. */
+    {
+        float m_mute  = s573_core_gain_mult(0);
+        float m_game  = s573_core_gain_mult(0xAF3CDu);
+        float m_unity = s573_core_gain_mult(0xBFBDEu);
+        int ok = 1;
+        if (m_mute != 0.0f) {
+            printf("FAIL: gain(0) = %f, expected exact 0 (mute)\n", m_mute); ok = 0;
+        }
+        if (m_game < 1.25f || m_game > 1.27f) {
+            printf("FAIL: gain(0xAF3CD) = %f, expected ~1.2589 (a BOOST)\n", m_game); ok = 0;
+        }
+        if (m_unity < 0.99f || m_unity > 1.01f) {
+            printf("FAIL: gain(0xBFBDE) = %f, expected ~1.0 (unity point)\n", m_unity); ok = 0;
+        }
+        if (m_game <= 1.0f) {
+            printf("FAIL: the game's gain must be > unity; if this ever flips, the "
+                   "'gain is not the clipping fix' conclusion needs revisiting\n"); ok = 0;
+        }
+        if (!ok) fails++;
+    }
+
+
+    if (!fails) printf("RESULT: PASS (s573mp3_core, 11 groups)\n");
     else        printf("RESULT: FAIL (s573mp3_core, %d checks failed)\n", fails);
     return fails ? 1 : 0;
 }
