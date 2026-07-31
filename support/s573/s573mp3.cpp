@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
+#include <math.h>   // test-tone sine (S573MP3_TONE)
 
 #include "../../user_io.h"
 #include "../../spi.h"
@@ -65,6 +66,10 @@ static struct
 	int              warned_mono;
 	int              warned_rate;
 	uint32_t         last_poll;
+	int              tone_en;      // S573MP3_TONE=1: substitute a generated sine
+	int              tone_ph;      // sine phase, samples mod 44100
+	int              hb_en;        // S573MP3_HB=1: periodic state line
+	uint32_t         last_hb;
 } s573;
 
 static uint32_t now_ms()
@@ -154,12 +159,41 @@ static int s573mp3_open()
 	s573_core_init(&s573.core);
 	mp3dec_init(&s573.dec);
 	s573.active = 1;
+	// Diagnostics, both opt-in via env so a normal boot is byte-identical in behaviour.
+	{
+		const char *t = getenv("S573MP3_TONE");
+		const char *h = getenv("S573MP3_HB");
+		s573.tone_en = (t && *t && *t != '0');
+		s573.hb_en   = (h && *h && *h != '0');
+		if (s573.tone_en) printf("s573mp3: TEST TONE enabled -- 440 Hz sine replaces decoded MP3\n");
+		if (s573.hb_en)   printf("s573mp3: heartbeat enabled\n");
+	}
 	// Loud on purpose: design risk #6 is a stale forked binary silently
 	// disabling MP3. If this line is missing from the log, the service is not
 	// running, whatever the core is doing.
 	printf("s573mp3: service up (DIO %08x, PCM ring %08x, %u beats)\n",
 	       S573_DIO_PHYS, S573_PCM_PHYS, S573_PCM_BEATS);
 	return 1;
+}
+
+// Periodic state line (S573MP3_HB=1). Every field here answers a specific "which
+// half is broken" question: epochs prove the SPI mailbox round-trips at all;
+// in_len/cons proves we are fetching the game's scrambled window; frames proves
+// minimp3 is decoding; wr/rd proves the fabric is DRAINING what we wrote (rd
+// advancing is the only evidence the audio side is alive).
+static void s573mp3_heartbeat(const s573_core_t *c, const struct ptrs_reply *r)
+{
+	if (!s573.hb_en) return;
+	uint32_t now = now_ms();
+	if (now - s573.last_hb < 2000) return;
+	s573.last_hb = now;
+	printf("s573mp3: rst=%u/%u ack=%d cfg=%u/%u have=%d | in_len=%u pos=%u cons=%u "
+	       "| frames=%u sync=%u idle=%u | wr=%u rd=%u free=%u | ctrl=%04x echo_bad=%u\n",
+	       c->rst_epoch, r->rst_epoch, c->rst_acked, c->cfg_epoch, r->cfg_epoch, c->have_cfg,
+	       c->in_len, c->in_pos, c->cons_bytes,
+	       c->frames, c->sync_cnt, c->idle_cnt,
+	       c->pcm_wr, c->pcm_rd, s573_core_pcm_free(c),
+	       c->ctrl_flags, c->ddrsbm_echo_bad);
 }
 
 // ---- the poll ----------------------------------------------------------------
@@ -231,6 +265,37 @@ void s573mp3_poll()
 	// 5. decode while there is ring space. STRICTLY space-gated -- never a
 	//    byte/time budget. See s573mp3_core.h.
 	int produced = 0;
+
+	// TEST TONE (S573MP3_TONE=1): substitute a generated 440 Hz sine for the decoded
+	// MP3 and write it through the SAME ring path. This bisects the transport: hearing
+	// the tone proves ring writes -> pointer accounting -> the fabric's 44100 Hz drain
+	// -> s573_audio_mix -> HDMI all work, so any silence is upstream (fetching or
+	// descrambling or decoding the game's data). Hearing nothing proves the delivery
+	// half is dead and the decode half is irrelevant for now. Diagnostic only -- it is
+	// off unless the env var is set, so a normal boot is unaffected.
+	if (s573.tone_en)
+	{
+		while (s573_core_should_decode(c, BEATS_PER_FRAME))
+		{
+			static short tone[1152 * 2];
+			for (int i = 0; i < 1152; i++)
+			{
+				// 440 Hz at 44100 Hz, quarter scale so it is unmistakable but not harsh
+				double th = 2.0 * 3.14159265358979 * 440.0 * (double)s573.tone_ph / 44100.0;
+				short v = (short)(8000.0 * sin(th));
+				tone[2*i] = v; tone[2*i+1] = v;
+				s573.tone_ph = (s573.tone_ph + 1) % 44100;
+			}
+			pcm_write(tone, sizeof(tone));
+			s573_core_wrote_pcm(c, (uint16_t)(sizeof(tone) / 8u));
+			produced = 1;
+		}
+		if (!produced) s573_core_note_idle(c);
+		ext_ctrl(s573_core_ctrl_events(c), c->ctrl_flags, NULL);
+		s573mp3_heartbeat(c, &r);
+		return;
+	}
+
 	while (s573_core_should_decode(c, BEATS_PER_FRAME))
 	{
 		mp3dec_frame_info_t info;
@@ -290,4 +355,6 @@ void s573mp3_poll()
 
 	// 6. hand the fabric this poll's cumulative event counts + control flags
 	ext_ctrl(s573_core_ctrl_events(c), c->ctrl_flags, NULL);
+
+	s573mp3_heartbeat(c, &r);
 }

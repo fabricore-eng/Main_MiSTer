@@ -287,8 +287,17 @@ char is_megacd()
 static int is_573_type = 0;
 char is_573()
 {
+	// orig_name is CONF_STR FIELD 0, not the .rbf filename -- and the 573 core is a
+	// PSX derivative whose CONF_STR still starts "PSX;...", so the original
+	// "Konami_System_573" test could NEVER be true. The MP3 service is gated on this
+	// function, so it silently never ran: no "s573mp3: service up" line, no audio,
+	// nothing else wrong. (Found 2026-07-31 on the first on-hardware MP3 test; the
+	// HPS host tests all pass because they exercise s573mp3_core.c, never this gate.)
+	// core_name IS 573-specific: it comes from the .mgl <setname>/.mra override
+	// ("System573"). Keep the orig_name arm too, so a future CONF_STR rename also works.
 	if (!is_573_type)
-		is_573_type = strncasecmp(orig_name, "Konami_System_573", 17) ? 2 : 1;
+		is_573_type = (!strncasecmp(orig_name, "Konami_System_573", 17)
+		            || !strncasecmp(core_name, "System573", 9)) ? 1 : 2;
 	return (is_573_type == 1);
 }
 
