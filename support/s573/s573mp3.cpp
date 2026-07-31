@@ -234,9 +234,14 @@ static void s573mp3_heartbeat(const s573_core_t *c, const struct ptrs_reply *r)
 	uint32_t now = now_ms();
 	if (now - s573.last_hb < 2000) return;
 	s573.last_hb = now;
-	printf("s573mp3: rst=%u/%u ack=%d cfg=%u/%u have=%d | in_len=%u pos=%u cons=%u "
+	/* desc.cur is the ONLY way to see the enable-toggle rewind bug from outside:
+	 * on a pause/resume with no setup rewrite it must stay put, not snap back to
+	 * mp3_start. Printed relative to the window so a rewind is obvious by eye. */
+	printf("s573mp3: rst=%u/%u ack=%d cfg=%u/%u have=%d | cur=+%u/%u | in_len=%u pos=%u cons=%u "
 	       "| frames=%u sync=%u idle=%u | wr=%u rd=%u free=%u | ctrl=%04x echo_bad=%u\n",
 	       c->rst_epoch, r->rst_epoch, c->rst_acked, c->cfg_epoch, r->cfg_epoch, c->have_cfg,
+	       (unsigned)(c->desc.cur - c->desc.mp3_start),
+	       (unsigned)(c->desc.mp3_end - c->desc.mp3_start),
 	       c->in_len, c->in_pos, c->cons_bytes,
 	       c->frames, c->sync_cnt, c->idle_cnt,
 	       c->pcm_wr, c->pcm_rd, s573_core_pcm_free(c),
