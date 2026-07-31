@@ -66,10 +66,13 @@ fabric owns it. `s573_desc_has_data()` is deliberately *not* that bit.
       installed on neither the dev Mac nor `dell` — dell has only the Quartus image.
       Needs a toolchain decision: install on dell, use a cross-compile container, or
       build on the MiSTer itself.
-- [ ] Extend the core repo's `tools/mister_load.sh` to scp this binary alongside the
-      `.rbf` (Decision A: accepted 2026-07-29).
-- [ ] `ctrl_flags` — nothing sets `S573_CTRL_DRAIN_EN` or the per-game `ddrsbm` bit
-      yet. `ddrsbm` comes from the fabric config word; drain-enable needs an owner.
+- [x] **Deploy** — `tools/mister_load.sh --with-main` in the core repo. Opt-in, refuses a
+      non-ARM ELF, warns if `s573mp3` did not link, keeps a `/media/fat/MiSTer.orig`
+      backup and stages + atomically moves rather than truncating the live binary.
+- [x] **`ctrl_flags` owners settled.** `ddrsbm` is the FABRIC's (OSD bit `O[101]`),
+      arriving in the MP3CFG word — we must not push it. `DRAIN_EN` follows the GAME's
+      `fpga_ctrl[13] & [14]` (play/stop), which k573dio now folds into `cfg_epoch` so we
+      actually see it change.
 - [ ] First hardware bring-up: `0xa8` advancing is the proof this service is live
       (design risk #6 — a stale binary silently disables MP3 with no error).
 

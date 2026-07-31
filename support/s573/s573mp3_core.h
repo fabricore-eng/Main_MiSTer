@@ -74,8 +74,13 @@ extern "C" {
 #define S573_IN_WINDOW       4096
 
 /* ctrl_flags bits (CMD_573_CTRL w2, fabric-bound) */
-#define S573_CTRL_DDRSBM     0x0001
+#define S573_CTRL_DDRSBM     0x0001   /* RESERVED: the fabric's OSD bit owns this */
 #define S573_CTRL_DRAIN_EN   0x0002
+
+/* MP3CFG word8 layout: {12'b0, fpga_ctrl[15:13], ddrsbm} */
+#define S573_CFG_FPGA_EN_SHIFT 1
+#define S573_CFG_MP3_ENABLE    (1u << (S573_CFG_FPGA_EN_SHIFT + 0))  /* fpga_ctrl[13] */
+#define S573_CFG_STREAM_ENABLE (1u << (S573_CFG_FPGA_EN_SHIFT + 1))  /* fpga_ctrl[14] */
 
 typedef struct {
     uint16_t start_lo, start_hi, end_lo, end_hi;

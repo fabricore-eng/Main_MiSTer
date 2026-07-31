@@ -49,6 +49,17 @@ void s573_core_apply_cfg(s573_core_t *c, const s573_cfg_t *cfg)
     c->ddrsbm_want     = (cfg->flags & S573_CTRL_DDRSBM) ? 1 : 0;
     c->ddrsbm_echo_bad = 0;
 
+    /* The PCM drain follows the GAME's intent, not ours: fabric stream_en is
+     * fpga_ctrl[13] & [14], and those bits are the game pressing play or stop.
+     * k573dio ticks cfg_epoch on them precisely so we see this. Running the drain
+     * when the game is stopped would tick the sample counter off an empty ring --
+     * or rather, underrun it -- and leaving it off when the game is playing is
+     * silence with nothing reporting an error. */
+    if ((cfg->flags & S573_CFG_MP3_ENABLE) && (cfg->flags & S573_CFG_STREAM_ENABLE))
+        c->ctrl_flags |= S573_CTRL_DRAIN_EN;
+    else
+        c->ctrl_flags &= (uint16_t)~S573_CTRL_DRAIN_EN;
+
     s573_desc_init(&c->desc, start, end,
                    cfg->key1, cfg->key2, cfg->key3,
                    c->ddrsbm_want);

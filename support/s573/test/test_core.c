@@ -37,7 +37,8 @@ static s573_cfg_t mkcfg(uint32_t start, uint32_t end, uint16_t epoch, int sbm)
     c.start_lo = start & 0xFFFF; c.start_hi = start >> 16;
     c.end_lo   = end   & 0xFFFF; c.end_hi   = end   >> 16;
     c.key1 = 0x1357; c.key2 = 0x2468; c.key3 = 0x9BDF;
-    c.flags = sbm ? S573_CTRL_DDRSBM : 0;
+    c.flags = (uint16_t)((sbm ? S573_CTRL_DDRSBM : 0)
+                         | S573_CFG_MP3_ENABLE | S573_CFG_STREAM_ENABLE);
     c.epoch = epoch;
     return c;
 }
@@ -56,11 +57,15 @@ int main(void)
     CHK(!s573_core_should_decode(&c, 1), "T1: decoding before rst ack");
     c.rst_acked = 1;
     CHK(!s573_core_should_decode(&c, 1), "T1: decoding before config");
+    /* game NOT playing: config adopted, but the drain must stay off */
     cfg = mkcfg(0x100, 0x900, 1, 0);
+    cfg.flags &= (uint16_t)~(S573_CFG_MP3_ENABLE | S573_CFG_STREAM_ENABLE);
     s573_core_apply_cfg(&c, &cfg);
-    CHK(!s573_core_should_decode(&c, 1), "T1: decoding while drain_en is clear");
-    s573_core_set_ctrl(&c, S573_CTRL_DRAIN_EN);
-    CHK(c.have_cfg, "T1: a ctrl change that leaves ddrsbm alone must NOT invalidate cfg");
+    CHK(c.have_cfg, "T1: config should still be adopted while stopped");
+    CHK(!s573_core_should_decode(&c, 1), "T1: decoding while the game is stopped");
+    /* game presses play */
+    cfg = mkcfg(0x100, 0x900, 2, 0);
+    s573_core_apply_cfg(&c, &cfg);
     CHK(s573_core_should_decode(&c, 1), "T1: still refusing with everything armed");
 
     /* ---- T2: pacing is ring-space only, never a timer ---- */
@@ -181,7 +186,26 @@ int main(void)
     s573_core_apply_cfg(&c, &cfg);
     CHK(c.desc.ddrsbm == 0, "T9: must re-adopt when the fabric changes it");
 
-    if (!fails) printf("RESULT: PASS (s573mp3_core, 9 groups)\n");
+    /* ---- T10: the drain follows the GAME's play/stop, not our own state ---- */
+    s573_core_init(&c);
+    c.rst_acked = 1;
+    cfg = mkcfg(0x100, 0x400, 20, 0);            /* helper sets both enables */
+    s573_core_apply_cfg(&c, &cfg);
+    CHK(c.ctrl_flags & S573_CTRL_DRAIN_EN, "T10: drain must follow the game playing");
+    CHK(s573_core_should_decode(&c, 1),     "T10: should decode while playing");
+
+    cfg.flags &= (uint16_t)~S573_CFG_STREAM_ENABLE;   /* game pressed stop */
+    cfg.epoch = 21;
+    s573_core_apply_cfg(&c, &cfg);
+    CHK(!(c.ctrl_flags & S573_CTRL_DRAIN_EN), "T10: drain must clear when the game stops");
+    CHK(!s573_core_should_decode(&c, 1),      "T10: must not decode while stopped");
+
+    cfg.flags |= S573_CFG_STREAM_ENABLE;              /* play again */
+    cfg.epoch = 22;
+    s573_core_apply_cfg(&c, &cfg);
+    CHK(c.ctrl_flags & S573_CTRL_DRAIN_EN, "T10: drain must come back on replay");
+
+    if (!fails) printf("RESULT: PASS (s573mp3_core, 10 groups)\n");
     else        printf("RESULT: FAIL (s573mp3_core, %d checks failed)\n", fails);
     return fails ? 1 : 0;
 }

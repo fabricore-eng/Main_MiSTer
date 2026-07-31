@@ -209,12 +209,10 @@ void s573mp3_poll()
 	if (!s573.adopted_baselines)
 	{
 		uint16_t base = 0;
-		// TODO(decision C): the scheme is OURS to choose and must be set BEFORE
-		// the first config adoption, or we descramble ddrsbm with the default
-		// schedule and produce noise. Nothing determines the mounted game yet,
-		// so this is hardcoded off and ddrsbm WILL NOT PLAY CORRECTLY until a
-		// per-game source exists. Loud comment rather than a silent default.
-		s573_core_set_ctrl(c, S573_CTRL_DRAIN_EN /* | S573_CTRL_DDRSBM */);
+		// Nothing to push here any more: the descramble scheme is the fabric's
+		// (OSD bit O[101]) and the PCM drain follows the game's own play/stop,
+		// both arriving in the MP3CFG word. This exchange exists only to ADOPT
+		// the fabric's cumulative event baselines.
 		ext_ctrl(0, c->ctrl_flags, &base);
 		c->sync_cnt = (uint8_t)(base >> 8);
 		c->idle_cnt = (uint8_t)(base & 0xFF);
