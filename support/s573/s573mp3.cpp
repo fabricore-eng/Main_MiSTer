@@ -311,7 +311,24 @@ void s573mp3_poll()
 	{
 		s573_cfg_t cfg;
 		ext_read_cfg(&cfg);
+		int drain_before = (c->ctrl_flags & S573_CTRL_DRAIN_EN) ? 1 : 0;
 		s573_core_apply_cfg(c, &cfg);
+		/* WHY THIS LINE: two completely different things can silence the music --
+		 * the GAME asking us to stop (enables clear, this path) and the song data
+		 * simply running out (the window-exhausted backstop in 5b, which prints its
+		 * own line). In the log they were indistinguishable, so "the music stopped"
+		 * could not be attributed to either. Reported 2026-07-31 that songs keep
+		 * playing past a failed stage and across menus, with the hypothesis that the
+		 * enable path never fires at all and only exhaustion ever stops anything.
+		 * This makes that directly countable. */
+		{
+			int drain_after = (c->ctrl_flags & S573_CTRL_DRAIN_EN) ? 1 : 0;
+			if (s573.hb_en && drain_after != drain_before)
+				printf("s573mp3: DRAIN %s via ENABLES (flags=%04x mp3_en=%d stream_en=%d)\n",
+				       drain_after ? "ON" : "OFF", cfg.flags,
+				       (int)!!(cfg.flags & S573_CFG_MP3_ENABLE),
+				       (int)!!(cfg.flags & S573_CFG_STREAM_ENABLE));
+		}
 		// gain_seen == 0: the game has not set a level yet -> unity, NOT mute.
 		s573.gain_l = cfg.gain_seen ? s573_core_gain_mult(cfg.gain_ll) : 1.0f;
 		s573.gain_r = cfg.gain_seen ? s573_core_gain_mult(cfg.gain_rr) : 1.0f;
@@ -457,7 +474,7 @@ void s573mp3_poll()
 		c->ctrl_flags &= (uint16_t)~S573_CTRL_DRAIN_EN;
 		mp3dec_init(&s573.dec);
 		if (s573.hb_en)
-			printf("s573mp3: song end -- window exhausted (cur=%08x end=%08x) and ring drained, drain OFF\n",
+			printf("s573mp3: DRAIN OFF via EXHAUSTION -- window done (cur=%08x end=%08x) and ring drained, drain OFF\n",
 			       c->desc.cur, c->desc.mp3_end);
 	}
 
