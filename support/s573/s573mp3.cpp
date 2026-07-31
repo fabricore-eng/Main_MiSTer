@@ -260,6 +260,18 @@ void s573mp3_poll()
 		s573_cfg_t cfg;
 		ext_read_cfg(&cfg);
 		s573_core_apply_cfg(c, &cfg);
+		// The drain is derived from flags bits MP3_ENABLE/STREAM_ENABLE (fabric
+		// fpga_ctrl[14:13]). If those never clear, the drain never clears and the
+		// music plays on past the game's stop -- so log the RAW flags on every
+		// config adoption. One line per epoch move, not per poll.
+		if (s573.hb_en)
+			printf("s573mp3: CFG epoch=%u flags=%04x (mp3_en=%d stream_en=%d ddrsbm=%d) start=%08x end=%08x\n",
+			       cfg.epoch, cfg.flags,
+			       (int)!!(cfg.flags & S573_CFG_MP3_ENABLE),
+			       (int)!!(cfg.flags & S573_CFG_STREAM_ENABLE),
+			       (int)!!(cfg.flags & S573_CTRL_DDRSBM),
+			       ((uint32_t)cfg.start_hi << 16) | cfg.start_lo,
+			       ((uint32_t)cfg.end_hi   << 16) | cfg.end_lo);
 	}
 
 	// 5. decode while there is ring space. STRICTLY space-gated -- never a
@@ -352,6 +364,27 @@ void s573mp3_poll()
 		}
 	}
 	if (!produced) s573_core_note_idle(c);
+
+	// 5b. SONG END. The drain must NOT be ended by fpga_ctrl[14:13]: ddrsbm asserts
+	//     both enables once and never clears them again (measured on hardware
+	//     2026-07-31 -- every config adoption after the first song reads
+	//     flags=000f while start/end are rewritten per song). Treat the enable as
+	//     a START gate only, and end on the honest signal instead: the descrambled
+	//     window is exhausted (cur >= mp3_end -- the same bound the fabric's own
+	//     stream_en uses) AND everything we decoded has been drained. Waiting for
+	//     the ring to empty lets the tail play out instead of truncating it.
+	//     Without this the music simply never stops: it plays through menus until
+	//     some later song happens to re-arm the window.
+	if ((c->ctrl_flags & S573_CTRL_DRAIN_EN)
+	    && c->desc.cur >= c->desc.mp3_end
+	    && c->pcm_wr == c->pcm_rd)
+	{
+		c->ctrl_flags &= (uint16_t)~S573_CTRL_DRAIN_EN;
+		mp3dec_init(&s573.dec);
+		if (s573.hb_en)
+			printf("s573mp3: song end -- window exhausted (cur=%08x end=%08x) and ring drained, drain OFF\n",
+			       c->desc.cur, c->desc.mp3_end);
+	}
 
 	// 6. hand the fabric this poll's cumulative event counts + control flags
 	ext_ctrl(s573_core_ctrl_events(c), c->ctrl_flags, NULL);
