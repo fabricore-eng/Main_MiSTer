@@ -205,6 +205,49 @@ int main(void)
     s573_core_apply_cfg(&c, &cfg);
     CHK(c.ctrl_flags & S573_CTRL_DRAIN_EN, "T10: drain must come back on replay");
 
+    /* ---- group 12: an ENABLE-ONLY cfg change must not rewind the stream ----
+     * cfg_epoch moves on fpga_ctrl[14:13] too, so a bare play/stop toggle reaches
+     * apply_cfg. MAME's enable bits only GATE -- a pause resumes in place. The
+     * oracle caught the exposing case: stop at t=439.378, restart at t=439.748 with
+     * no start/end rewrite between. Re-initialising there restarts the song. */
+    {
+        s573_core_t c2;
+        s573_cfg_t  cf;
+        uint32_t    mid;
+        s573_core_init(&c2);
+        memset(&cf, 0, sizeof(cf));
+        cf.start_lo = 0x1000; cf.start_hi = 0x0000;
+        cf.end_lo   = 0x0000; cf.end_hi   = 0x0010;
+        cf.key1 = 0x1111; cf.key2 = 0x2222; cf.key3 = 0x3333;
+        cf.flags = 0x000f;                      /* both enables set */
+        s573_core_apply_cfg(&c2, &cf);
+        c2.have_cfg = 1;
+
+        /* pretend we decoded a way into the song */
+        c2.desc.cur = c2.desc.mp3_start + 0x4000;
+        mid = c2.desc.cur;
+
+        /* enable-only change: same setup, enables cleared then set again */
+        cf.flags = 0x000b;                      /* STREAMING_ENABLE low = stop */
+        s573_core_apply_cfg(&c2, &cf);
+        cf.flags = 0x000f;                      /* and back = resume */
+        s573_core_apply_cfg(&c2, &cf);
+        if (c2.desc.cur != mid) {
+            printf("FAIL: enable toggle rewound cur %08x -> %08x (should resume in place)\n",
+                   mid, c2.desc.cur);
+            fails++;
+        }
+
+        /* a REAL setup change must still re-init */
+        cf.start_lo = 0x8000;
+        s573_core_apply_cfg(&c2, &cf);
+        if (c2.desc.cur != c2.desc.mp3_start) {
+            printf("FAIL: a start/end rewrite did NOT re-init (cur=%08x start=%08x)\n",
+                   c2.desc.cur, c2.desc.mp3_start);
+            fails++;
+        }
+    }
+
     /* ---- group 11: MAS3507D output gain curve (MAME mas3507d verbatim) ----
      * The value that matters is the one ddrsbm actually sends, captured off the
      * MAME oracle: 0xAF3CD. It is a BOOST (x1.2589), which is why applying the
@@ -232,7 +275,7 @@ int main(void)
     }
 
 
-    if (!fails) printf("RESULT: PASS (s573mp3_core, 11 groups)\n");
+    if (!fails) printf("RESULT: PASS (s573mp3_core, 12 groups)\n");
     else        printf("RESULT: FAIL (s573mp3_core, %d checks failed)\n", fails);
     return fails ? 1 : 0;
 }

@@ -61,9 +61,32 @@ void s573_core_apply_cfg(s573_core_t *c, const s573_cfg_t *cfg)
     else
         c->ctrl_flags &= (uint16_t)~S573_CTRL_DRAIN_EN;
 
-    s573_desc_init(&c->desc, start, end,
-                   cfg->key1, cfg->key2, cfg->key3,
-                   c->ddrsbm_want);
+    /* ENABLE-ONLY CHANGES MUST NOT REWIND THE STREAM.
+     * cfg_epoch moves on fpga_ctrl[14:13] as well as on a setup write, so a bare
+     * play/stop toggle lands here too. MAME is explicit that the enable bits only
+     * GATE: set_fpga_ctrl calls reset_playback() on the decoder FIFO and never
+     * touches mp3_cur_addr or the key schedule, so a pause RESUMES in place rather
+     * than restarting the window (573 docs/2026-07-03-p4-mp3-pacing-model.md).
+     *
+     * Re-initialising unconditionally rewound `cur` to mp3_start on every toggle.
+     * The oracle caught the case that exposes it: a stop at t=439.378 and a restart
+     * at t=439.748 with NO start/end rewrite in between -- a mid-song pause/resume,
+     * which we would have restarted from the top of the window.
+     *
+     * So only re-init when the SETUP actually changed. */
+    {
+        int setup_changed = (start != c->desc.mp3_start)
+                         || (end   != c->desc.mp3_end)
+                         || (cfg->key1 != c->desc.key1_seed)
+                         || (cfg->key2 != c->desc.key2_seed)
+                         || (cfg->key3 != c->desc.key3_seed)
+                         || (c->ddrsbm_want != c->desc.ddrsbm)
+                         || !c->have_cfg;
+        if (setup_changed)
+            s573_desc_init(&c->desc, start, end,
+                           cfg->key1, cfg->key2, cfg->key3,
+                           c->ddrsbm_want);
+    }
 
     c->in_len   = 0;
     c->in_pos   = 0;
