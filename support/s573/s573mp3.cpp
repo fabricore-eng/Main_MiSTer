@@ -313,6 +313,27 @@ void s573mp3_poll()
 		ext_read_cfg(&cfg);
 		int drain_before = (c->ctrl_flags & S573_CTRL_DRAIN_EN) ? 1 : 0;
 		s573_core_apply_cfg(c, &cfg);
+
+		/* ADOPT THE EPOCH THIS TEST ACTUALLY COMPARES.
+		 * The condition above tests r.cfg_epoch -- the FULL 16-bit counter, snapshotted
+		 * into the hot PTRS poll (s573_hps_ext.v:324). But apply_cfg adopts cfg.epoch,
+		 * and MP3CFG word0 carries only the LOW 8 BITS by design:
+		 *   io_dout <= {8'd0, cfg_epoch[7:0]};      (s573_hps_ext.v:335, doc'd at :127)
+		 * Below 256 the two agree by luck. The moment the fabric's counter passes 255
+		 * they can NEVER be equal again, so this branch re-fires on EVERY poll: it
+		 * re-applies a stale config -- re-arming DRAIN_EN from that config's stream_en
+		 * -- and resets in_len/in_pos/cons_bytes, so decode cannot advance either. The
+		 * game's stop is overwritten a few ms later, every time: THE MUSIC NEVER STOPS.
+		 * Measured on de10 2026-08-02: healthy while the epoch was <=247, then 229/229
+		 * heartbeats diverged with adopted == fabric % 256 exactly, and the drain
+		 * oscillated ON-via-ENABLES/OFF-via-EXHAUSTION ~70k times.
+		 * This also retires the old "846,906 stream_en=0 adoptions prove the firmware
+		 * sees stops" reading -- that count was this runaway's signature, not evidence.
+		 * The fabric is correct as designed; the 8-bit word is an identity echo. */
+		if (s573.hb_en && (uint8_t)(r.cfg_epoch & 0xff) != (uint8_t)(cfg.epoch & 0xff))
+			printf("s573mp3: WARNING torn cfg read -- PTRS epoch %u (low byte %u) != MP3CFG echo %u; re-reading next poll\n",
+			       r.cfg_epoch, (unsigned)(r.cfg_epoch & 0xff), (unsigned)cfg.epoch);
+		c->cfg_epoch = r.cfg_epoch;
 		/* WHY THIS LINE: two completely different things can silence the music --
 		 * the GAME asking us to stop (enables clear, this path) and the song data
 		 * simply running out (the window-exhausted backstop in 5b, which prints its
