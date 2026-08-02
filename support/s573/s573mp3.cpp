@@ -398,7 +398,42 @@ void s573mp3_poll()
 		if (rearmed)
 		{
 			mp3dec_init(&s573.dec);        // drop any partially decoded frame
-			s573.pcm_flush_pending = 1;    // ring itself is flushed in 1b, deferred
+
+			/* IMMEDIATE vs DEFERRED, decided by the drain state BEFORE this
+			 * adoption -- not after it.
+			 *
+			 * ddrsbm delivers a new song as ONE adoption carrying the new window
+			 * AND stream_en=1 together (observed: epoch N flags=000f with a fresh
+			 * start/end, after a bare stop at N-1 flags=000b). So at a re-arm the
+			 * drain is going ON, and a flush deferred to "once the drain is off"
+			 * never fires at all -- measured on de10: zero flushes across a full
+			 * attract cycle while music was demonstrably playing.
+			 *
+			 * When drain_before is 0 the deferral is also unnecessary: the fabric
+			 * reader has been parked since the stop MANY polls ago (seconds, vs the
+			 * ~240 us it needs to back up on wr_full), so fab_pcm_rd read at the top
+			 * of this poll is stable. Flush right here, before step 5 writes any of
+			 * the new song's PCM into the ring.
+			 *
+			 * When drain_before is 1 -- a new window while still draining -- the
+			 * read pointer IS moving, so collapsing against it could land us behind
+			 * it, and have_data is a bare inequality: the reader would chase us
+			 * 65535 beats the long way round. Defer that case to 1b and say so
+			 * rather than risk it. Not observed on ddrsbm. */
+			if (!drain_before)
+			{
+				uint16_t dropped = pcm_ring_collapse(c);
+				s573.pcm_flush_pending = 0;
+				if (s573.hb_en && dropped > 1)
+					printf("s573mp3: PCM FLUSH -- dropped %u undrained beats (%.3f s) from the previous song, wr=%u rd=%u\n",
+					       dropped, (double)dropped * 2.0 / 44100.0, c->pcm_wr, c->pcm_rd);
+			}
+			else
+			{
+				s573.pcm_flush_pending = 1;
+				if (s573.hb_en)
+					printf("s573mp3: PCM FLUSH deferred -- re-armed while still draining\n");
+			}
 		}
 
 		/* ADOPT THE EPOCH THIS TEST ACTUALLY COMPARES.
