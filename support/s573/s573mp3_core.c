@@ -37,8 +37,9 @@ void s573_core_set_ctrl(s573_core_t *c, uint16_t flags)
     c->ctrl_flags = (uint16_t)(flags & (uint16_t)~S573_CTRL_DDRSBM);
 }
 
-void s573_core_apply_cfg(s573_core_t *c, const s573_cfg_t *cfg)
+int s573_core_apply_cfg(s573_core_t *c, const s573_cfg_t *cfg)
 {
+    int setup_changed;
     uint32_t start = ((uint32_t)cfg->start_hi << 16) | cfg->start_lo;
     uint32_t end   = ((uint32_t)cfg->end_hi   << 16) | cfg->end_lo;
     /* The scheme is the FABRIC's to state, not ours to guess: it comes from the
@@ -74,19 +75,17 @@ void s573_core_apply_cfg(s573_core_t *c, const s573_cfg_t *cfg)
      * which we would have restarted from the top of the window.
      *
      * So only re-init when the SETUP actually changed. */
-    {
-        int setup_changed = (start != c->desc.mp3_start)
-                         || (end   != c->desc.mp3_end)
-                         || (cfg->key1 != c->desc.key1_seed)
-                         || (cfg->key2 != c->desc.key2_seed)
-                         || (cfg->key3 != c->desc.key3_seed)
-                         || (c->ddrsbm_want != c->desc.ddrsbm)
-                         || !c->have_cfg;
-        if (setup_changed)
-            s573_desc_init(&c->desc, start, end,
-                           cfg->key1, cfg->key2, cfg->key3,
-                           c->ddrsbm_want);
-    }
+    setup_changed = (start != c->desc.mp3_start)
+                 || (end   != c->desc.mp3_end)
+                 || (cfg->key1 != c->desc.key1_seed)
+                 || (cfg->key2 != c->desc.key2_seed)
+                 || (cfg->key3 != c->desc.key3_seed)
+                 || (c->ddrsbm_want != c->desc.ddrsbm)
+                 || !c->have_cfg;
+    if (setup_changed)
+        s573_desc_init(&c->desc, start, end,
+                       cfg->key1, cfg->key2, cfg->key3,
+                       c->ddrsbm_want);
 
     c->in_len   = 0;
     c->in_pos   = 0;
@@ -97,13 +96,39 @@ void s573_core_apply_cfg(s573_core_t *c, const s573_cfg_t *cfg)
     c->cfg_epoch   = cfg->epoch;
     c->have_cfg    = 1;
     c->cfg_reloads++;
+    /* Tell the caller whether this was a NEW WINDOW (MAME's
+     * update_mp3_decode_state event) or a bare enable toggle. Only the former
+     * makes the PCM still in the ring stale -- see the flush in s573mp3.cpp. */
+    return setup_changed;
 }
 
 uint16_t s573_core_pcm_free(const s573_core_t *c)
 {
+    /* BOTH cursors are FULL 16-BIT LAPPING pointers: a 15-bit beat index plus a
+     * wrap MSB. The MSB is not decoration. The fabric's emptiness test is a
+     * full-width equality -- `have_data = (hps_wr_ptr != fab_rd_ptr)`
+     * (rtl/s573_pcm_ring.v:83, both ports [BEATS_LOG2:0] at :54-55) -- and only
+     * the wrap bit lets it tell "empty" from "one whole lap behind".
+     *
+     * We used to mask our side to 15 bits here and in s573_core_wrote_pcm, so
+     * hps_wr_ptr[15] was ALWAYS 0 while fab_rd_ptr[15] toggles every 32768
+     * beats. For half of every lap the two could therefore never compare equal:
+     * the reader saw data in a physically empty ring, lapped it, and replayed up
+     * to 1.486 s of already-drained PCM -- audible as the previous song bleeding
+     * into the next one, with underrun_cnt reading a clean 0 throughout. It also
+     * made the exhaustion backstop's `pcm_wr == pcm_rd` test (s573mp3.cpp)
+     * unsatisfiable half the time.
+     *
+     * The fabric has always specified 16 bits (rtl/s573_hps_ext.v:46-49 and
+     * rtl/s573_pcm_ring.v:43-47, which even guards elaboration against silently
+     * truncating the wrap bit) and the ring TB drives it that way
+     * (sim/tb_s573_pcm_ring.v:33,:103). We were the only side masking. */
+    uint16_t used = (uint16_t)(c->pcm_wr - c->pcm_rd);
+    /* used >= BEATS means the fabric read PAST us -- impossible unless a pointer
+     * moved backwards. Report no room rather than overwrite undrained PCM. */
+    if (used >= S573_PCM_BEATS) return 0;
     /* one beat held back so full and empty are distinguishable, matching the
      * fabric ring's own convention */
-    uint16_t used = (uint16_t)((c->pcm_wr - c->pcm_rd) & (S573_PCM_BEATS - 1));
     return (uint16_t)(S573_PCM_BEATS - 1 - used);
 }
 
@@ -146,7 +171,10 @@ void s573_core_consume(s573_core_t *c, uint32_t n)
 
 void s573_core_wrote_pcm(s573_core_t *c, uint16_t beats)
 {
-    c->pcm_wr = (uint16_t)((c->pcm_wr + beats) & (S573_PCM_BEATS - 1));
+    /* plain 16-bit wrap -- NOT & (S573_PCM_BEATS - 1). The wrap MSB is part of
+     * the pointer the fabric compares; see s573_core_pcm_free. Every consumer
+     * that turns this into a byte offset must mask it there instead. */
+    c->pcm_wr = (uint16_t)(c->pcm_wr + beats);
     c->sync_cnt++;           /* cumulative 8-bit; the fabric diffs mod 256 */
     c->frames++;
 }

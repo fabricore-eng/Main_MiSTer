@@ -63,6 +63,7 @@ static struct
 	volatile uint8_t *dio;     // scrambled source window (read-only for us)
 	volatile uint8_t *pcm;     // PCM ring (write-only for us)
 	int              adopted_baselines;
+	int              pcm_flush_pending;  // a new window is armed; drop the old PCM
 	int              warned_mono;
 	int              warned_rate;
 	uint32_t         last_poll;
@@ -171,9 +172,35 @@ static void s573_apply_gain(int16_t *pcm, int samples_stereo, float gl, float gr
 // mapping is uncached (/dev/mem O_SYNC), so this is a straight store loop; a
 // memcpy into it is fine but must not be re-ordered past the SPI exchange that
 // advertises the new write pointer -- hence the barrier in the caller.
+// Collapse the PCM ring to AT MOST ONE undrained beat. Returns what was pending.
+//
+// WHY rd+1 AND NOT rd. The ring reader can be parked mid-beat in S_PUSH0/S_PUSH1
+// (rtl/s573_pcm_ring.v:125-129) with a beat already fetched from DDR3 and
+// fab_rd_ptr NOT yet incremented -- exactly the state wr_full creates at a stop.
+// Targeting rd would let that pending increment land on re-arm and put fab_rd_ptr
+// one beat AHEAD of us; have_data is a bare inequality (s573_pcm_ring.v:83), not
+// an ordering compare, so the reader would then chase us the long way round the
+// 16-bit pointer space -- 65535 beats, ~2.97 s of stale ring, twice the bug we
+// are fixing. rd+1 is a fixed point in BOTH parked states: parked mid-beat the
+// retiring push lands exactly on us; parked idle it costs one stale beat
+// (2 stereo samples, 45 us). For the same reason we never rest at pend == 0.
+static uint16_t pcm_ring_collapse(s573_core_t *c)
+{
+	uint16_t pend = (uint16_t)(c->pcm_wr - c->pcm_rd);
+	if (pend > 1) c->pcm_wr = (uint16_t)(c->pcm_rd + 1u);
+	return pend;
+}
+
 static void pcm_write(const int16_t *pcm, uint32_t bytes)
 {
-	uint32_t byte_off = (uint32_t)s573.core.pcm_wr * 8u;
+	/* pcm_wr is a 16-bit LAPPING pointer (beat index + wrap MSB), so bit15 MUST
+	 * be masked off before it becomes a byte offset. Unmasked, any pcm_wr above
+	 * 0x8000 makes `S573_PCM_BYTES - byte_off` underflow below, `run > bytes`
+	 * then clamps it, and the memcpy walks off the end of the 256 KiB mapping
+	 * established at s573mp3_open(). The mask belongs HERE, at the consumer that
+	 * needs a byte offset -- not in s573_core_wrote_pcm, whose value is what the
+	 * fabric's full-width emptiness compare consumes. */
+	uint32_t byte_off = ((uint32_t)s573.core.pcm_wr * 8u) & (S573_PCM_BYTES - 1);
 	const uint8_t *src = (const uint8_t *)pcm;
 
 	while (bytes)
@@ -273,6 +300,33 @@ void s573mp3_poll()
 	ext_ptrs(c->pcm_wr, s573_core_credit_word(c), c->rst_epoch, &r);
 	c->pcm_rd = r.fab_pcm_rd;
 
+	// 1b. DEFERRED PCM-RING FLUSH (armed in step 4 below).
+	//
+	//     WHY DEFERRED. Landing hps_wr_ptr even ONE beat BEHIND fab_rd_ptr is worse
+	//     than the bug: have_data is `!=`, not an ordering compare
+	//     (rtl/s573_pcm_ring.v:83), so the reader would walk 65535 beats before the
+	//     two could meet again. The pointer we just read is only trustworthy once
+	//     fab_rd_ptr has STOPPED, and it only stops once drain_en has been low IN
+	//     THE FABRIC for a whole poll -- the ring reader has no drain_en input at
+	//     all (port list rtl/s573_pcm_ring.v:49-68) and keeps pulling until the
+	//     512-sample elastic buffer backs it up on wr_full. ctrl_flags only reaches
+	//     the fabric at the END of a poll, so a flush computed in the same poll as
+	//     the stop would be reading a moving target.
+	if (c->ctrl_flags & S573_CTRL_DRAIN_EN)
+	{
+		// Drain is back before we ever got a frozen pointer. Drop the intent
+		// rather than fire it late, against the NEW song's PCM.
+		s573.pcm_flush_pending = 0;
+	}
+	else if (s573.pcm_flush_pending)
+	{
+		uint16_t dropped = pcm_ring_collapse(c);
+		s573.pcm_flush_pending = 0;
+		if (s573.hb_en && dropped > 1)
+			printf("s573mp3: PCM FLUSH -- dropped %u undrained beats (%.3f s), wr=%u rd=%u\n",
+			       dropped, (double)dropped * 2.0 / 44100.0, c->pcm_wr, c->pcm_rd);
+	}
+
 	// 2. reset handling. The core-load reset bumps rst_epoch too, so this fires
 	//    on the very first poll and gives every reset one code path.
 	if (r.rst_epoch != c->rst_epoch || !c->rst_acked)
@@ -283,6 +337,9 @@ void s573mp3_poll()
 			mp3dec_init(&s573.dec);
 			s573.adopted_baselines = 0;
 			memset((void *)s573.pcm, 0, S573_PCM_BYTES);
+			// the whole ring and pcm_wr are zeroed here, so any armed flush
+			// intent refers to a ring that no longer exists
+			s573.pcm_flush_pending = 0;
 		}
 		// ack it; pointers thaw from the NEXT poll
 		ext_ptrs(0, 0, c->rst_epoch, &r);
@@ -312,7 +369,37 @@ void s573mp3_poll()
 		s573_cfg_t cfg;
 		ext_read_cfg(&cfg);
 		int drain_before = (c->ctrl_flags & S573_CTRL_DRAIN_EN) ? 1 : 0;
-		s573_core_apply_cfg(c, &cfg);
+		int rearmed      = s573_core_apply_cfg(c, &cfg);
+
+		/* A NEW WINDOW -- so the PCM still sitting in the ring belongs to a song we
+		 * are never going to play again. Arm a flush.
+		 *
+		 * THE ORACLE. MAME's update_mp3_decode_state() runs on any write to
+		 * start/end/key1-3 and does cur = start, re-seed keys, frame_counter = 0,
+		 * reset_counter() AND mas3507d->reset_playback(), which throws away already
+		 * DECODED audio as well as the input FIFO (573
+		 * docs/2026-07-03-p4-mp3-pacing-model.md:87-89). We never have -- the known
+		 * reset_playback gap (docs/2026-07-31-mp3-audio-WORKING.md:94-97). The
+		 * difference is depth, not kind: MAME buffers about one 1152-sample frame,
+		 * we buffer a 32768-beat ring that should_decode deliberately keeps within
+		 * 576 beats of full, i.e. 1.46-1.49 s of the previous song.
+		 *
+		 * GATED ON `rearmed`, NOT ON THE ENABLE EDGE -- this is the load-bearing
+		 * choice. cfg_epoch also moves on fpga_ctrl[14:13], so a bare play/stop
+		 * toggle lands in apply_cfg too. On such a toggle the PCM at fab_rd_ptr is
+		 * NOT stale: it is exactly the audio the resume is meant to continue with.
+		 * Dropping it while desc.cur is preserved would fast-forward the song by up
+		 * to 1.49 s -- the rewind's evil twin, and just as much a violation of "an
+		 * enable-only toggle must not move the stream" as re-initialising the
+		 * descrambler was. MAME draws the line in the same place: set_fpga_ctrl's
+		 * reset_playback() never touches mp3_cur_addr or the key schedule, while
+		 * update_mp3_decode_state() -- our `rearmed` -- does both. So: flush where
+		 * MAME re-inits the window, and nowhere else. */
+		if (rearmed)
+		{
+			mp3dec_init(&s573.dec);        // drop any partially decoded frame
+			s573.pcm_flush_pending = 1;    // ring itself is flushed in 1b, deferred
+		}
 
 		/* ADOPT THE EPOCH THIS TEST ACTUALLY COMPARES.
 		 * The condition above tests r.cfg_epoch -- the FULL 16-bit counter, snapshotted

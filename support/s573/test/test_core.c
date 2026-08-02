@@ -77,8 +77,23 @@ int main(void)
     /* wrapped: wr behind rd numerically but the ring is nearly empty */
     c.pcm_wr = 4; c.pcm_rd = 2;
     CHK(s573_core_pcm_free(&c) == S573_PCM_BEATS - 3, "T2: free space, no wrap");
-    c.pcm_wr = 1; c.pcm_rd = (uint16_t)(S573_PCM_BEATS - 2);
+    /* The SAME state, now expressed WITH the wrap bit: one beat past a lap
+     * boundary is BEATS+1, not 1. Under the old 15-bit mask those two were
+     * indistinguishable -- which is precisely what let the fabric's full-width
+     * compare (rtl/s573_pcm_ring.v:83) mistake an empty ring for a whole lap of
+     * pending data and replay it. Expected free count is unchanged. */
+    c.pcm_wr = (uint16_t)(S573_PCM_BEATS + 1); c.pcm_rd = (uint16_t)(S573_PCM_BEATS - 2);
     CHK(s573_core_pcm_free(&c) == S573_PCM_BEATS - 4, "T2: free space across the wrap");
+    /* EXACTLY ONE LAP AHEAD -- the ring is completely FULL. This is the case the
+     * old 15-bit mask got catastrophically wrong: (wr - rd) = 0x8000 masked to 15
+     * bits reads as 0, i.e. "empty", so we would have overwritten 32767 undrained
+     * beats. The wrap bit is the only thing that distinguishes this from empty. */
+    c.pcm_wr = (uint16_t)S573_PCM_BEATS; c.pcm_rd = 0;
+    CHK(s573_core_pcm_free(&c) == 0, "T2: a full lap ahead reads FULL, not empty");
+    CHK(!s573_core_should_decode(&c, 1), "T2: decoded into a fully-lapped ring");
+    /* fabric read PAST us -- report no room rather than overwrite */
+    c.pcm_wr = 0; c.pcm_rd = 1;
+    CHK(s573_core_pcm_free(&c) == 0, "T2: rd ahead of wr reports no room");
     c.pcm_wr = 0; c.pcm_rd = 0;
 
     /* ---- T3: the stream comes through intact, in arbitrary chunks ---- */
@@ -164,10 +179,16 @@ int main(void)
     f0 = s573_core_ctrl_events(&c);
     CHK((f0 >> 8) == c.sync_cnt && (f0 & 0xFF) == c.idle_cnt, "T7: ctrl event packing");
 
-    /* ---- T8: pcm_wr wraps at the ring size, never runs off ---- */
+    /* ---- T8: pcm_wr laps at 2^16, CARRYING the wrap bit the fabric compares ----
+     * It must NOT fold at the ring size: hps_wr_ptr and fab_rd_ptr are both
+     * [15:0] in the fabric and compared for full-width equality
+     * (rtl/s573_pcm_ring.v:54-55,:83). Folding here is what made an empty ring
+     * read as non-empty for half of every lap. */
     s573_core_init(&c);
     for (n = 0; n < S573_PCM_BEATS + 17; n++) s573_core_wrote_pcm(&c, 1);
-    CHK(c.pcm_wr == 17, "T8: pcm_wr should wrap to 17, got %u", c.pcm_wr);
+    CHK(c.pcm_wr == (uint16_t)(S573_PCM_BEATS + 17),
+        "T8: pcm_wr should keep the wrap bit and read %u, got %u",
+        (unsigned)(uint16_t)(S573_PCM_BEATS + 17), c.pcm_wr);
 
     /* ---- T9: the descramble scheme comes FROM the fabric (OSD bit O[101]) ----
      * We must not set it ourselves and must not ignore it. k573dio folds the OSD
@@ -196,14 +217,26 @@ int main(void)
 
     cfg.flags &= (uint16_t)~S573_CFG_STREAM_ENABLE;   /* game pressed stop */
     cfg.epoch = 21;
-    s573_core_apply_cfg(&c, &cfg);
+    CHK(s573_core_apply_cfg(&c, &cfg) == 0,
+        "T10: a bare STOP is not a re-arm -- must report 0");
     CHK(!(c.ctrl_flags & S573_CTRL_DRAIN_EN), "T10: drain must clear when the game stops");
     CHK(!s573_core_should_decode(&c, 1),      "T10: must not decode while stopped");
 
     cfg.flags |= S573_CFG_STREAM_ENABLE;              /* play again */
     cfg.epoch = 22;
-    s573_core_apply_cfg(&c, &cfg);
+    /* THE FLUSH GATE. The service drops the ring's undrained PCM only when this
+     * returns 1. A bare resume must report 0: that PCM is exactly the audio the
+     * resume continues with, and discarding it would fast-forward the song by up
+     * to 1.49 s -- the mirror image of the rewind bug group 12 guards against. */
+    CHK(s573_core_apply_cfg(&c, &cfg) == 0,
+        "T10: a bare RESUME is not a re-arm -- must report 0");
     CHK(c.ctrl_flags & S573_CTRL_DRAIN_EN, "T10: drain must come back on replay");
+
+    /* A genuinely NEW WINDOW must report 1, or the stale PCM is never dropped and
+     * the previous song bleeds ~1.49 s into the next one. */
+    cfg = mkcfg(0x8000, 0xC000, 23, 0);
+    CHK(s573_core_apply_cfg(&c, &cfg) == 1,
+        "T10: a new start/end window IS a re-arm -- must report 1");
 
     /* ---- group 12: an ENABLE-ONLY cfg change must not rewind the stream ----
      * cfg_epoch moves on fpga_ctrl[14:13] too, so a bare play/stop toggle reaches

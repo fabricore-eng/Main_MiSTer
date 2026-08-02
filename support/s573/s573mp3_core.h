@@ -123,8 +123,12 @@ typedef struct {
     uint32_t in_pos;           /* consumed prefix */
 
     /* --- PCM ring accounting, in BEATS (1 beat = 2 stereo frames = 8 bytes) --- */
-    uint16_t pcm_wr;           /* our write cursor, beats, mod S573_PCM_BEATS */
-    uint16_t pcm_rd;           /* the fabric's read cursor, last seen */
+    /* BOTH are FULL 16-BIT LAPPING cursors: a 15-bit beat index plus a wrap MSB.
+     * The fabric's empty/full compare is a full-width equality on exactly these
+     * bits (rtl/s573_pcm_ring.v:83), so the MSB must survive here -- mask to a
+     * byte offset at the point of use. See s573_core_pcm_free. */
+    uint16_t pcm_wr;           /* our write cursor, beats, 16-bit lapping */
+    uint16_t pcm_rd;           /* the fabric's read cursor, last seen, 16-bit */
 
     /* --- what we report back --- */
     uint32_t cons_bytes;       /* CUMULATIVE bytes consumed since the last reload */
@@ -162,8 +166,13 @@ void s573_core_set_ctrl(s573_core_t *c, uint16_t flags);
  * the consumption counter, because the fabric zeroes its own baseline on the
  * same re-arm. Uses OUR ddrsbm intent for the scheme and only CHECKS the echo --
  * a mismatch sets ddrsbm_echo_bad, which means the fabric is descrambling
- * differently than we are and the audio will be noise. */
-void s573_core_apply_cfg(s573_core_t *c, const s573_cfg_t *cfg);
+ * differently than we are and the audio will be noise.
+ *
+ * RETURNS 1 if the descrambler was re-armed to a NEW WINDOW (start/end/keys or
+ * the scheme changed) -- i.e. MAME's update_mp3_decode_state() event -- and 0
+ * for a bare enable toggle, which only GATES. Callers use this to decide whether
+ * PCM already in the ring belongs to a song that will never be played again. */
+int s573_core_apply_cfg(s573_core_t *c, const s573_cfg_t *cfg);
 
 /* Free space in the PCM ring, in beats, leaving one beat so full != empty. */
 uint16_t s573_core_pcm_free(const s573_core_t *c);
