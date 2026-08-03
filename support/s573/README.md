@@ -36,7 +36,7 @@ The split exists so the parts that are easy to get *silently* wrong can be teste
 without hardware. Run them:
 
 ```
-cd support/s573/test && cc -O2 -Wall -Wextra -std=c99 -I.. -o test_core test_core.c ../s573mp3_core.c ../s573_descramble.c && ./test_core
+cd support/s573/test && cc -O2 -Wall -Wextra -std=c99 -I.. -o test_core test_core.c ../s573mp3_core.c ../s573_descramble.c -lm && ./test_core
 ```
 
 Verified they can fail, not just pass: mutating cumulative→per-poll credit fails 123

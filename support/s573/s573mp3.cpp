@@ -73,7 +73,18 @@ static struct
 	float            gain_l;       // MAS3507D output gain, applied to decoded PCM
 	float            gain_r;       // (1.0 until the game sets one -- never boot muted)
 	uint32_t         last_hb;
+	// Consecutive polls that decoded nothing. See the WRITER RACE note at the
+	// decode loop: a stall means we have caught up with the game's uploader, not
+	// that the data is bad, so we wait rather than skipping forward.
+	uint32_t         stall_polls;
+	int              warned_stall;
 } s573;
+
+// How many consecutive no-progress polls to wait before stepping past the byte
+// we are stuck on. Polls are ~5 ms, so this is ~1 s of patience -- far longer
+// than the uploader's ~85 ms gap between 4 KB chunks, and short enough that a
+// genuinely corrupt byte degrades to a brief glitch instead of a hung song.
+#define S573_STALL_LIMIT 200u
 
 static uint32_t now_ms()
 {
@@ -232,6 +243,7 @@ static int s573mp3_open()
 
 	s573_core_init(&s573.core);
 	mp3dec_init(&s573.dec);
+	s573.stall_polls = 0; s573.warned_stall = 0;  // new window: fresh patience budget
 	s573.active = 1;
 	// Diagnostics, both opt-in via env so a normal boot is byte-identical in behaviour.
 	{
@@ -335,6 +347,7 @@ void s573mp3_poll()
 		{
 			s573_core_on_reset(c, r.rst_epoch);
 			mp3dec_init(&s573.dec);
+			s573.stall_polls = 0; s573.warned_stall = 0;  // new window: fresh patience budget
 			s573.adopted_baselines = 0;
 			memset((void *)s573.pcm, 0, S573_PCM_BYTES);
 			// the whole ring and pcm_wr are zeroed here, so any armed flush
@@ -398,6 +411,11 @@ void s573mp3_poll()
 		if (rearmed)
 		{
 			mp3dec_init(&s573.dec);        // drop any partially decoded frame
+			/* A new window starts its WRITER RACE patience budget fresh. Carrying
+			 * the previous song's stall count over would spend this song's budget
+			 * before it began -- and this is the site that matters, because a
+			 * streamed song arms its window with almost nothing uploaded yet. */
+			s573.stall_polls = 0; s573.warned_stall = 0;
 
 			/* IMMEDIATE vs DEFERRED, decided by the drain state BEFORE this
 			 * adoption -- not after it.
@@ -537,6 +555,54 @@ void s573mp3_poll()
 		samples = mp3dec_decode_frame(&s573.dec, c->in + c->in_pos, (int)avail,
 		                              pcm, &info);
 		if (info.frame_bytes <= 0) break;        // need more input
+
+		// ---- WRITER RACE: do NOT consume a frame that decoded to nothing ----
+		//
+		// DDR does not hand us a fully-populated window. For songs it streams
+		// during play it arms the window and enables the stream FIRST, then
+		// uploads the data behind us: the k573dio write pointer (ram_adr, 0xb0/
+		// 0xb2) climbs from 0 to the window end over ~29 s while playback runs.
+		// MAME oracle, ddrs2k, one song (tools/mame_dio_regs.lua):
+		//     170.181  ram_adr = 0x00000000        upload begins
+		//     170.282  start=0 end=0x0015bdc3, keys set, STREAM_EN=1
+		//     199.032  ram_adr = 0x0015b000        1.42 MB, ~29 s later
+		//
+		// Reading past that pointer returns memory the game has not written.
+		// minimp3 reports unwritten/garbage input as frame_bytes>0 with
+		// samples==0 -- "no frame here, skip these bytes" -- which is the right
+		// answer for a corrupt stream and exactly the wrong one for a stream
+		// that has not arrived yet. Consuming on it let a SINGLE 5 ms poll burn
+		// the whole 1.42 MB window: 40 real frames (1.045 s of audio) followed
+		// by 1.4 MB of nothing, then DRAIN OFF via EXHAUSTION -- so the music cut
+		// out after a second and the game, which paces a stage off the MP3 sample
+		// counter, ended the stage on the spot.
+		//
+		// So a zero-sample decode does not advance: we re-read the same position
+		// next poll and stay BEHIND the writer instead of racing it. The margin
+		// is comfortable -- the game uploads at ~49 KB/s against ~16 KB/s of
+		// playback, so it stays ahead once we stop outrunning it.
+		//
+		// Songs preloaded during NOW LOADING (the windows with a non-zero start)
+		// are fully resident and never hit this path at all, which is why this
+		// stayed invisible until a title streamed a song during play.
+		if (samples <= 0 && info.frame_bytes > 0)
+		{
+			if (s573.stall_polls < S573_STALL_LIMIT)
+				break;                            // wait for the writer
+
+			// STALL GUARD. Waiting forever would turn a single bad byte into a
+			// hung song with nothing reporting an error, which is the failure
+			// mode this project refuses to ship. Step past it, loudly.
+			if (!s573.warned_stall)
+			{
+				printf("s573mp3: STALL GUARD -- no decodable frame at +%u for %u polls; "
+				       "stepping past %d bytes (corrupt data, or the writer never arrived)\n",
+				       (unsigned)(c->desc.cur - c->desc.mp3_start),
+				       (unsigned)s573.stall_polls, info.frame_bytes);
+				s573.warned_stall = 1;
+			}
+			s573.stall_polls = 0;
+		}
 		s573_core_consume(c, (uint32_t)info.frame_bytes);
 
 		if (samples > 0)
@@ -582,6 +648,14 @@ void s573mp3_poll()
 	}
 	if (!produced) s573_core_note_idle(c);
 
+	// Track how long we have been getting nothing out. This is the patience the
+	// WRITER RACE break above spends: while the game's uploader is still catching
+	// up we decode nothing and simply wait, and the moment a real frame lands the
+	// count resets. Only a stall that outlives S573_STALL_LIMIT polls is treated
+	// as bad data rather than as data-not-yet-written.
+	if (produced) { s573.stall_polls = 0; s573.warned_stall = 0; }
+	else if (s573.stall_polls < 0xffffffffu) s573.stall_polls++;
+
 	// 5b. SONG END -- a SECOND end condition, not the only one.
 	//
 	//     CORRECTION 2026-07-31 (later the same day): the claim that used to sit
@@ -616,6 +690,7 @@ void s573mp3_poll()
 	{
 		c->ctrl_flags &= (uint16_t)~S573_CTRL_DRAIN_EN;
 		mp3dec_init(&s573.dec);
+		s573.stall_polls = 0; s573.warned_stall = 0;  // new window: fresh patience budget
 		if (s573.hb_en)
 			printf("s573mp3: DRAIN OFF via EXHAUSTION -- window done (cur=%08x end=%08x) and ring drained, drain OFF\n",
 			       c->desc.cur, c->desc.mp3_end);
