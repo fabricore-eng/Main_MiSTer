@@ -585,6 +585,20 @@ void s573mp3_poll()
 			struct status_reply st0;
 			ext_status(&st0);
 			s573.song_underrun_base = st0.underrun;
+			/* The heartbeat's first sample of `lead` arrives up to 2 s after a
+			 * song starts, by which point a streaming writer has run well ahead
+			 * and the reading looks safe. The audible wrong-song bit at the top
+			 * of the attract video happens INSIDE that blind window, so measure
+			 * the frontier at adoption too: negative here means we are about to
+			 * decode bytes the game has not written for this window yet, which
+			 * is stale content from whatever occupied that region before. */
+			if (s573.hb_en)
+			{
+				uint32_t st = ((uint32_t)cfg.start_hi << 16) | cfg.start_lo;
+				printf("s573mp3: SONG START -- window %08x..%08x, writer at %08x (lead %+d)\n",
+				       st, ((uint32_t)cfg.end_hi << 16) | cfg.end_lo, st0.ram_wr,
+				       (int)((int64_t)st0.ram_wr - (int64_t)st));
+			}
 		}
 		if (s573.hb_en)
 			printf("s573mp3: CFG epoch=%u flags=%04x (mp3_en=%d stream_en=%d ddrsbm=%d) start=%08x end=%08x\n",
@@ -671,9 +685,19 @@ void s573mp3_poll()
 		// is comfortable -- the game uploads at ~49 KB/s against ~16 KB/s of
 		// playback, so it stays ahead once we stop outrunning it.
 		//
-		// Songs preloaded during NOW LOADING (the windows with a non-zero start)
-		// are fully resident and never hit this path at all, which is why this
-		// stayed invisible until a title streamed a song during play.
+		// MEASURED 2026-08-03, and it REFUTES the paragraph above as the whole
+		// story. With the writer frontier now readable, every stall in a full
+		// session had the data ALREADY WRITTEN at the point we choked on:
+		//   attract window (start=0, genuinely streamed): stalled at +16228 with
+		//     the writer 45,212 bytes AHEAD of us;
+		//   stage windows (non-zero start, preloaded): stalled with ram_adr about
+		//     15 MB away in another region entirely -- so those windows are fully
+		//     resident and STILL hit this path, which this comment said could not
+		//     happen.
+		// So "the writer never arrived" is not what these stalls are. The offsets
+		// also repeat exactly across runs (+265996 three times, +20408/10/12),
+		// which is content-dependent, not a race. Suspicion has moved to the
+		// descrambled bytes themselves -- hence the dump below.
 		if (samples <= 0 && info.frame_bytes > 0)
 		{
 			if (s573.stall_polls < S573_STALL_LIMIT)
@@ -684,10 +708,20 @@ void s573mp3_poll()
 			// mode this project refuses to ship. Step past it, loudly.
 			if (!s573.warned_stall)
 			{
+				/* Dump what we choked on. A valid MPEG-1 Layer III frame starts
+				 * FF Fx; descrambled-but-wrong data is the hypothesis this
+				 * separates, and 32 bytes is enough to see a sync word (or its
+				 * absence) without flooding the log. */
+				char hex[3 * 32 + 1];
+				uint32_t n = c->in_len - c->in_pos;
+				if (n > 32) n = 32;
+				for (uint32_t k = 0; k < n; k++)
+					sprintf(hex + 3 * k, "%02x ", c->in[c->in_pos + k]);
+				hex[n ? 3 * n - 1 : 0] = 0;
 				printf("s573mp3: STALL GUARD -- no decodable frame at +%u for %u polls; "
-				       "stepping past %d bytes (corrupt data, or the writer never arrived)\n",
+				       "stepping past %d bytes; bytes here: %s\n",
 				       (unsigned)(c->desc.cur - c->desc.mp3_start),
-				       (unsigned)s573.stall_polls, info.frame_bytes);
+				       (unsigned)s573.stall_polls, info.frame_bytes, hex);
 				s573.warned_stall = 1;
 			}
 			s573.stall_polls = 0;
