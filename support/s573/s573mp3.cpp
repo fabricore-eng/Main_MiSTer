@@ -63,7 +63,6 @@ static struct
 	volatile uint8_t *dio;     // scrambled source window (read-only for us)
 	volatile uint8_t *pcm;     // PCM ring (write-only for us)
 	int              adopted_baselines;
-	int              pcm_flush_pending;  // a new window is armed; drop the old PCM
 	int              warned_mono;
 	int              warned_rate;
 	uint32_t         last_poll;
@@ -195,11 +194,35 @@ static void s573_apply_gain(int16_t *pcm, int samples_stereo, float gl, float gr
 // are fixing. rd+1 is a fixed point in BOTH parked states: parked mid-beat the
 // retiring push lands exactly on us; parked idle it costs one stale beat
 // (2 stereo samples, 45 us). For the same reason we never rest at pend == 0.
-static uint16_t pcm_ring_collapse(s573_core_t *c)
+// How far AHEAD of the last-seen read pointer a live collapse must land.
+//
+// Collapsing to rd+1 is only safe when the reader has STOPPED. While it is
+// draining, c->pcm_rd is a snapshot that is already stale by up to one poll, and
+// have_data is a bare inequality (rtl/s573_pcm_ring.v:83) -- so landing even one
+// beat BEHIND the true read pointer sends the reader 65535 beats the long way
+// round, which is far worse than the stale audio we came to drop.
+//
+// The reader drains 44100 samples/s = 22050 beats/s. A poll is ~5 ms, so it can
+// advance ~110 beats between our snapshot and the write. 256 is >2x that, and
+// costs only 256*2/44100 = 11.6 ms of the old song left in the ring -- against
+// the ~1.47 s it removes.
+#define PCM_COLLAPSE_MARGIN 256u
+
+// Drop undrained PCM. `margin` is where the write pointer lands relative to the
+// last-seen read pointer: 1 when the reader is stopped, PCM_COLLAPSE_MARGIN when
+// it is still running. Returns the beats dropped.
+static uint16_t pcm_ring_collapse_m(s573_core_t *c, uint16_t margin)
 {
 	uint16_t pend = (uint16_t)(c->pcm_wr - c->pcm_rd);
-	if (pend > 1) c->pcm_wr = (uint16_t)(c->pcm_rd + 1u);
+	// Nothing to do if the ring already holds less than the margin -- moving the
+	// write pointer FORWARD there would fabricate beats of garbage audio.
+	if (pend > margin) c->pcm_wr = (uint16_t)(c->pcm_rd + margin);
 	return pend;
+}
+
+static uint16_t pcm_ring_collapse(s573_core_t *c)
+{
+	return pcm_ring_collapse_m(c, 1u);
 }
 
 static void pcm_write(const int16_t *pcm, uint32_t bytes)
@@ -318,32 +341,26 @@ void s573mp3_poll()
 	// and BEFORE the next credit_word() is sent, which is exactly here.
 	s573_core_credit_drained(c);
 
-	// 1b. DEFERRED PCM-RING FLUSH (armed in step 4 below).
+	// 1b. (was: DEFERRED PCM-RING FLUSH.)
 	//
-	//     WHY DEFERRED. Landing hps_wr_ptr even ONE beat BEHIND fab_rd_ptr is worse
-	//     than the bug: have_data is `!=`, not an ordering compare
+	//     REMOVED 2026-08-03. The flush is now unconditional at the re-arm site in
+	//     step 4, with PCM_COLLAPSE_MARGIN making it safe against a moving reader.
+	//
+	//     The deferral was the right instinct about the wrong risk. It correctly
+	//     identified that landing hps_wr_ptr even ONE beat BEHIND fab_rd_ptr is
+	//     catastrophic -- have_data is `!=`, not an ordering compare
 	//     (rtl/s573_pcm_ring.v:83), so the reader would walk 65535 beats before the
-	//     two could meet again. The pointer we just read is only trustworthy once
-	//     fab_rd_ptr has STOPPED, and it only stops once drain_en has been low IN
-	//     THE FABRIC for a whole poll -- the ring reader has no drain_en input at
-	//     all (port list rtl/s573_pcm_ring.v:49-68) and keeps pulling until the
-	//     512-sample elastic buffer backs it up on wr_full. ctrl_flags only reaches
-	//     the fabric at the END of a poll, so a flush computed in the same poll as
-	//     the stop would be reading a moving target.
-	if (c->ctrl_flags & S573_CTRL_DRAIN_EN)
-	{
-		// Drain is back before we ever got a frozen pointer. Drop the intent
-		// rather than fire it late, against the NEW song's PCM.
-		s573.pcm_flush_pending = 0;
-	}
-	else if (s573.pcm_flush_pending)
-	{
-		uint16_t dropped = pcm_ring_collapse(c);
-		s573.pcm_flush_pending = 0;
-		if (s573.hb_en && dropped > 1)
-			printf("s573mp3: PCM FLUSH -- dropped %u undrained beats (%.3f s), wr=%u rd=%u\n",
-			       dropped, (double)dropped * 2.0 / 44100.0, c->pcm_wr, c->pcm_rd);
-	}
+	//     two could meet again. But the chosen remedy was to WAIT for a poll with
+	//     the drain off, and then to DROP the intent entirely if the drain came back
+	//     first. On a title that re-arms while still draining, that "if" is the
+	//     common case, so the flush usually never happened: three "PCM FLUSH
+	//     deferred" in one measured session, each leaving ~1.47 s of the previous
+	//     song in the ring, which desynchronises the chart by exactly that much
+	//     (see the note at the re-arm site).
+	//
+	//     Landing AHEAD of the reader by a margin larger than it can travel in a
+	//     poll gets the same safety without ever having to wait -- so there is no
+	//     longer any deferred state to service here.
 
 	// 2. reset handling. The core-load reset bumps rst_epoch too, so this fires
 	//    on the very first poll and gives every reset one code path.
@@ -356,9 +373,6 @@ void s573mp3_poll()
 			s573.stall_polls = 0; s573.warned_stall = 0;  // new window: fresh patience budget
 			s573.adopted_baselines = 0;
 			memset((void *)s573.pcm, 0, S573_PCM_BYTES);
-			// the whole ring and pcm_wr are zeroed here, so any armed flush
-			// intent refers to a ring that no longer exists
-			s573.pcm_flush_pending = 0;
 		}
 		// ack it; pointers thaw from the NEXT poll
 		ext_ptrs(0, 0, c->rst_epoch, &r);
@@ -444,20 +458,27 @@ void s573mp3_poll()
 			 * it, and have_data is a bare inequality: the reader would chase us
 			 * 65535 beats the long way round. Defer that case to 1b and say so
 			 * rather than risk it. Not observed on ddrsbm. */
-			if (!drain_before)
-			{
-				uint16_t dropped = pcm_ring_collapse(c);
-				s573.pcm_flush_pending = 0;
-				if (s573.hb_en && dropped > 1)
-					printf("s573mp3: PCM FLUSH -- dropped %u undrained beats (%.3f s) from the previous song, wr=%u rd=%u\n",
-					       dropped, (double)dropped * 2.0 / 44100.0, c->pcm_wr, c->pcm_rd);
-			}
-			else
-			{
-				s573.pcm_flush_pending = 1;
-				if (s573.hb_en)
-					printf("s573mp3: PCM FLUSH deferred -- re-armed while still draining\n");
-			}
+			// FLUSH NOW IN BOTH CASES, with the margin doing the safety work.
+			//
+			// Deferring the draining case (and dropping the intent when the drain
+			// came back first) meant the ring kept ~1.47 s of the PREVIOUS song.
+			// That misaligns the chart, because the fabric anchors its sample
+			// counter at t=0 on the first DECODE of the new song and then advances
+			// it on DRAINED samples (rtl/k573dio.v:405-410). With stale audio still
+			// queued, the counter spends the old song's remaining 1.47 s before the
+			// new song is audible at all -- so every arrow lands that far early.
+			// Measured 2026-08-03: three "PCM FLUSH deferred" in one session, and
+			// the two flushes that did fire dropped 1.470 s and 1.467 s.
+			//
+			// A live collapse is safe as long as we land AHEAD of where the reader
+			// can have reached -- see PCM_COLLAPSE_MARGIN.
+			uint16_t dropped = pcm_ring_collapse_m(
+				c, drain_before ? (uint16_t)PCM_COLLAPSE_MARGIN : 1u);
+			if (s573.hb_en && dropped > 1)
+				printf("s573mp3: PCM FLUSH -- dropped %u undrained beats (%.3f s) from the previous song%s, wr=%u rd=%u\n",
+				       dropped, (double)dropped * 2.0 / 44100.0,
+				       drain_before ? " (live, margin 256)" : "",
+				       c->pcm_wr, c->pcm_rd);
 		}
 
 		/* ADOPT THE EPOCH THIS TEST ACTUALLY COMPARES.
