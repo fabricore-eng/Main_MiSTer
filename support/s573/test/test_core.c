@@ -125,7 +125,17 @@ int main(void)
         }
         CHK(vn == rn, "T3: %u bytes through the service vs %u direct", vn, (unsigned)rn);
         CHK(memcmp(ref, via, vn) == 0, "T3: byte stream differs from the direct pull");
-        CHK(c.cons_bytes == vn, "T3: cons_bytes %u != bytes consumed %u", c.cons_bytes, vn);
+        /* Playback-paced credit (2026-08-03): nothing was decoded here, so every
+         * byte is still awaiting attachment to a frame rather than credited.
+         * Assert conservation -- the bytes must be accounted for SOMEWHERE. */
+        {
+            uint32_t queued = 0; uint8_t qi;
+            for (qi = c.cq_tail; qi != c.cq_head; qi = (uint8_t)((qi + 1) % S573_CREDIT_Q))
+                queued += c.credit_q[qi].bytes;
+            CHK(c.cons_bytes + queued + c.cq_pending == vn,
+                "T3: consumed bytes lost (credit %u + queued %u + pending %u != %u)",
+                (unsigned)c.cons_bytes, (unsigned)queued, (unsigned)c.cq_pending, vn);
+        }
     }
 
     /* ---- T4: credit is CUMULATIVE and monotonic; the word truncates, the
@@ -143,7 +153,22 @@ int main(void)
         if (!avail) break;
         s573_core_consume(&c, avail);
         total += avail;
-        CHK(c.cons_bytes == total, "T4: credit drifted at step %u", n);
+        /* Since 2026-08-03 the credit is PLAYBACK-paced, so it deliberately does
+         * NOT move on consume -- the old `cons_bytes == total` here encoded the
+         * decode pacing that put the chart 1.473 s ahead of the music. What must
+         * still hold, and is the stronger property, is CONSERVATION: every byte
+         * consumed is either already credited, queued against a decoded frame,
+         * or pending attachment to the next one. Nothing may be lost or counted
+         * twice. */
+        {
+            uint32_t queued = 0; uint8_t qi;
+            for (qi = c.cq_tail; qi != c.cq_head; qi = (uint8_t)((qi + 1) % S573_CREDIT_Q))
+                queued += c.credit_q[qi].bytes;
+            CHK(c.cons_bytes + queued + c.cq_pending == total,
+                "T4: consumed bytes lost at step %u (credit %u + queued %u + pending %u != %u)",
+                n, (unsigned)c.cons_bytes, (unsigned)queued,
+                (unsigned)c.cq_pending, (unsigned)total);
+        }
     }
     CHK(total > 4000, "T4: expected a long run, got %u bytes", total);
     c.cons_bytes = 0x1FFFF;
@@ -308,7 +333,119 @@ int main(void)
     }
 
 
-    if (!fails) printf("RESULT: PASS (s573mp3_core, 12 groups)\n");
+    /* ---- T13: the credit follows PLAYBACK, not decode -------------------
+     * This is the group that pins the 2026-08-03 timing fix. Before it, the
+     * credit was bumped inside consume(), so the game's position ran a full PCM
+     * ring (measured 1.473 s) ahead of the audio and every arrow arrived early.
+     * Each check below fails if the credit slips back to decode pacing. */
+    {
+        s573_core_t c; int ok = 1;
+        s573_core_init(&c);
+        c.in_len = 4096; c.in_pos = 0;
+
+        /* consuming alone must NOT credit anything -- nothing has been heard */
+        s573_core_consume(&c, 400);
+        s573_core_consume(&c, 417);
+        CHK(s573_core_credit_word(&c) == 0,
+            "T13: consume() alone credited %u; the credit must wait for playback",
+            (unsigned)s573_core_credit_word(&c));
+
+        /* decoding attaches those bytes to a frame, but they are still unheard */
+        s573_core_wrote_pcm(&c, 576);
+        CHK(s573_core_credit_word(&c) == 0,
+            "T13: a decoded-but-undrained frame credited %u; must still be 0",
+            (unsigned)s573_core_credit_word(&c));
+
+        /* a PARTIAL drain of that frame still credits nothing (whole frames only) */
+        c.pcm_rd = 300; s573_core_credit_drained(&c);
+        CHK(s573_core_credit_word(&c) == 0,
+            "T13: a partly drained frame credited %u; must be whole-frame",
+            (unsigned)s573_core_credit_word(&c));
+
+        /* once its last beat leaves the ring, ALL its bytes are credited at once */
+        c.pcm_rd = 576; s573_core_credit_drained(&c);
+        CHK(s573_core_credit_word(&c) == 817,
+            "T13: fully drained frame credited %u, expected 817 (400+417)",
+            (unsigned)s573_core_credit_word(&c));
+
+        /* bytes that decoded to NOTHING (a stall-guard skip) must not be lost --
+         * they ride with the next frame that does produce audio */
+        c.in_len = 4096; c.in_pos = 0;        /* consume() clamps to staged bytes */
+        s573_core_consume(&c, 4096);          /* skipped garbage, no PCM */
+        c.in_len = 4096; c.in_pos = 0;
+        s573_core_consume(&c, 418);           /* the frame that follows it */
+        s573_core_wrote_pcm(&c, 576);
+        c.pcm_rd = 1152; s573_core_credit_drained(&c);
+        CHK(s573_core_credit_word(&c) == 817 + 4096 + 418,
+            "T13: skipped bytes were lost -- credit %u, expected %u",
+            (unsigned)s573_core_credit_word(&c), 817u + 4096u + 418u);
+
+        /* pcm_rd LAPS: it is a 16-bit cursor with a wrap MSB, so the delta must be
+         * a lapping subtraction. A plain compare goes backwards once per lap and
+         * the credit would stall for a whole ring. */
+        {
+            s573_core_t d; s573_core_init(&d);
+            d.in_len = 4096;
+            d.pcm_rd = 65500; d.cq_last_rd = 65500;
+            s573_core_consume(&d, 500);
+            s573_core_wrote_pcm(&d, 576);
+            d.pcm_rd = (uint16_t)(65500 + 576);   /* wraps through 0 */
+            s573_core_credit_drained(&d);
+            CHK(s573_core_credit_word(&d) == 500,
+                "T13: credit did not survive a pcm_rd lap (got %u, expected 500)",
+                (unsigned)s573_core_credit_word(&d));
+        }
+
+        /* a new window must not inherit the old queue, and must re-base on the LIVE
+         * pcm_rd -- zeroing it would make the next poll see a huge phantom delta */
+        {
+            s573_core_t e; s573_cfg_t cfg; s573_core_init(&e);
+            e.in_len = 4096;
+            s573_core_consume(&e, 900);
+            s573_core_wrote_pcm(&e, 576);
+            e.pcm_rd = 40000;                     /* fabric is mid-ring */
+            memset(&cfg, 0, sizeof cfg);
+            cfg.epoch = 7; cfg.end_lo = 0x1000;
+            s573_core_apply_cfg(&e, &cfg);
+            s573_core_credit_drained(&e);
+            CHK(s573_core_credit_word(&e) == 0,
+                "T13: re-arm leaked %u bytes of credit from the previous song",
+                (unsigned)s573_core_credit_word(&e));
+            CHK(e.cq_last_rd == 40000,
+                "T13: re-arm left cq_last_rd at %u, not the live pcm_rd 40000 -- "
+                "the next poll would jump the position to the end of the song",
+                (unsigned)e.cq_last_rd);
+        }
+
+        /* queue OVERFLOW must merge, never drop: a lost entry silently
+         * under-credits the position forever */
+        {
+            s573_core_t f; s573_core_init(&f);
+            uint32_t total = 0, need, done = 0; int i;
+            for (i = 0; i < S573_CREDIT_Q + 20; i++) {
+                f.in_len = 4096; f.in_pos = 0;
+                s573_core_consume(&f, 100); total += 100;
+                s573_core_wrote_pcm(&f, 576);
+            }
+            /* Drain in steps small enough to stay a valid 16-bit LAPPING delta.
+             * One giant jump would alias mod 65536 and silently under-drain --
+             * which is a property of the cursor, not of the code under test. */
+            need = 576u * (uint32_t)(S573_CREDIT_Q + 20);
+            while (done < need) {
+                uint32_t step = need - done; if (step > 30000u) step = 30000u;
+                f.pcm_rd = (uint16_t)(f.pcm_rd + step);
+                s573_core_credit_drained(&f);
+                done += step;
+            }
+            CHK(f.cons_bytes == total,
+                "T13: overflow lost credit -- got %u, expected %u",
+                (unsigned)f.cons_bytes, (unsigned)total);
+        }
+
+        if (!ok) fails++;
+    }
+
+    if (!fails) printf("RESULT: PASS (s573mp3_core, 13 groups)\n");
     else        printf("RESULT: FAIL (s573mp3_core, %d checks failed)\n", fails);
     return fails ? 1 : 0;
 }

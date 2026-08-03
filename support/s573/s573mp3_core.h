@@ -73,6 +73,14 @@ extern "C" {
 #define S573_IN_CHUNK        1024
 #define S573_IN_WINDOW       4096
 
+/* Credit queue depth: one entry per decoded frame still resident in the PCM
+ * ring. The ring holds S573_PCM_BEATS/576 = ~57 MPEG-1 Layer III frames, so
+ * 128 is comfortable headroom. On overflow we MERGE into the newest entry
+ * rather than dropping -- losing an entry would silently under-credit the
+ * position and desync the chart, which is the exact bug this queue exists to
+ * fix. */
+#define S573_CREDIT_Q        128
+
 /* ctrl_flags bits (CMD_573_CTRL w2, fabric-bound) */
 #define S573_CTRL_DDRSBM     0x0001   /* RESERVED: the fabric's OSD bit owns this */
 #define S573_CTRL_DRAIN_EN   0x0002
@@ -130,8 +138,36 @@ typedef struct {
     uint16_t pcm_wr;           /* our write cursor, beats, 16-bit lapping */
     uint16_t pcm_rd;           /* the fabric's read cursor, last seen, 16-bit */
 
+    /* --- credit pacing: PLAYBACK, not decode -------------------------------
+     * cons_bytes is what the fabric turns into a stream position, and the GAME
+     * reads that position to place every arrow in the chart. It must therefore
+     * track what the player HEARS, not what we have decoded.
+     *
+     * It used to be bumped inside s573_core_consume(), i.e. the instant bytes
+     * were handed to the decoder. We decode as fast as ring space allows, so
+     * the credit ran a full ring ahead of the speaker. Measured on de10
+     * 2026-08-03 across 344 draining polls: ring occupancy median 32,484 of
+     * 32,768 beats = 1.473 s. The chart was paced ~1.5 s ahead of the music --
+     * unplayable for a rhythm game, and invisible to every counter we had,
+     * because nothing was wrong with the decode itself.
+     *
+     * So bytes now wait in a small queue and are credited only as the fabric
+     * DRAINS the PCM they produced. Bytes that yielded no PCM (a stall-guard
+     * skip) ride along with the next frame that did, so the running total stays
+     * exact. Granularity is one frame -- credit lands when a frame's last beat
+     * leaves the ring, ~26 ms -- which is three orders below the 1.473 s of
+     * error it removes.
+     *
+     * This does NOT touch song-end detection: exhaustion is tested against
+     * desc.cur (the DRAM pull position), never against cons_bytes. */
+    struct { uint32_t bytes; uint16_t beats; } credit_q[S573_CREDIT_Q];
+    uint8_t  cq_head, cq_tail;  /* ring indices; head == tail means empty */
+    uint32_t cq_pending;        /* consumed, not yet attached to a decoded frame */
+    uint32_t cq_drained;        /* beats drained, not yet matched to an entry */
+    uint16_t cq_last_rd;        /* pcm_rd as of the last credit_drained() call */
+
     /* --- what we report back --- */
-    uint32_t cons_bytes;       /* CUMULATIVE bytes consumed since the last reload */
+    uint32_t cons_bytes;       /* CUMULATIVE bytes PLAYED since the last reload */
     uint8_t  sync_cnt;         /* CUMULATIVE decoded-frame count (8-bit, wraps) */
     uint8_t  idle_cnt;         /* CUMULATIVE no-frame-decode count */
     uint16_t ctrl_flags;       /* what we PUSH down (CMD_573_CTRL w2) */
@@ -204,6 +240,11 @@ uint16_t s573_core_ctrl_events(const s573_core_t *c);
 /* The CMD_573_PTRS w2 payload: cumulative consumed bytes, truncated to 16 bits.
  * Truncation is CORRECT -- the fabric diffs mod 2^16 and 65536 bytes is 1.6 s at
  * 320 kbps against a ~5 ms poll. */
+/* Advance the PLAYBACK credit to match the fabric's read cursor. Call once per
+ * poll AFTER c->pcm_rd has been refreshed from CMD_573_PTRS. Pops every queue
+ * entry whose PCM has fully left the ring and adds its bytes to cons_bytes. */
+void s573_core_credit_drained(s573_core_t *c);
+
 uint16_t s573_core_credit_word(const s573_core_t *c);
 
 #ifdef __cplusplus

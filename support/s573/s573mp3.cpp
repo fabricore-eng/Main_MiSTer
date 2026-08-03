@@ -312,6 +312,12 @@ void s573mp3_poll()
 	ext_ptrs(c->pcm_wr, s573_core_credit_word(c), c->rst_epoch, &r);
 	c->pcm_rd = r.fab_pcm_rd;
 
+	// Advance the PLAYBACK credit to the read cursor we just learned. This is what
+	// makes the game's chart follow the speaker instead of the decoder -- see the
+	// credit-pacing note in s573mp3_core.h. It must run AFTER pcm_rd is refreshed
+	// and BEFORE the next credit_word() is sent, which is exactly here.
+	s573_core_credit_drained(c);
+
 	// 1b. DEFERRED PCM-RING FLUSH (armed in step 4 below).
 	//
 	//     WHY DEFERRED. Landing hps_wr_ptr even ONE beat BEHIND fab_rd_ptr is worse

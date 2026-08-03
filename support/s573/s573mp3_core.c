@@ -93,6 +93,16 @@ int s573_core_apply_cfg(s573_core_t *c, const s573_cfg_t *cfg)
      * baseline went with it -- so ours must too, or our first post-song report
      * would look like a huge delta and dump credit into the new window. */
     c->cons_bytes  = 0;
+    /* The credit queue describes the PREVIOUS song's PCM. Carrying it over would
+     * pay this window's position with the last one's bytes. cq_last_rd is re-based
+     * on the LIVE pcm_rd rather than zeroed: the fabric's read cursor does not
+     * restart at 0, so a zero here would make the next credit_drained() see an
+     * enormous phantom delta and jump the position straight to the song's end. */
+    c->cq_head    = 0;
+    c->cq_tail    = 0;
+    c->cq_pending = 0;
+    c->cq_drained = 0;
+    c->cq_last_rd = c->pcm_rd;
     c->cfg_epoch   = cfg->epoch;
     c->have_cfg    = 1;
     c->cfg_reloads++;
@@ -165,8 +175,12 @@ void s573_core_consume(s573_core_t *c, uint32_t n)
 {
     uint32_t avail = c->in_len - c->in_pos;
     if (n > avail) n = avail;
-    c->in_pos     += n;
-    c->cons_bytes += n;      /* CUMULATIVE -- never reset except on re-arm */
+    c->in_pos    += n;
+    /* NOT cons_bytes. These bytes are not "played" until the PCM they decode to
+     * has actually left the ring -- see the credit-pacing note in the header.
+     * They wait here and are attached to the next frame that produces PCM, so
+     * bytes that yielded nothing (a stall-guard skip) still get credited. */
+    c->cq_pending += n;
 }
 
 void s573_core_wrote_pcm(s573_core_t *c, uint16_t beats)
@@ -175,6 +189,25 @@ void s573_core_wrote_pcm(s573_core_t *c, uint16_t beats)
      * the pointer the fabric compares; see s573_core_pcm_free. Every consumer
      * that turns this into a byte offset must mask it there instead. */
     c->pcm_wr = (uint16_t)(c->pcm_wr + beats);
+
+    /* Attach everything consumed since the last frame to THIS frame's beats, so
+     * the credit for those bytes is paid when this audio is heard. Overflow
+     * MERGES into the newest entry instead of dropping one: an entry lost here
+     * would permanently under-credit the position. */
+    {
+        uint8_t next = (uint8_t)((c->cq_head + 1u) % S573_CREDIT_Q);
+        if (next == c->cq_tail) {
+            uint8_t last = (uint8_t)((c->cq_head + S573_CREDIT_Q - 1u) % S573_CREDIT_Q);
+            c->credit_q[last].bytes += c->cq_pending;
+            c->credit_q[last].beats  = (uint16_t)(c->credit_q[last].beats + beats);
+        } else {
+            c->credit_q[c->cq_head].bytes = c->cq_pending;
+            c->credit_q[c->cq_head].beats = beats;
+            c->cq_head = next;
+        }
+        c->cq_pending = 0;
+    }
+
     c->sync_cnt++;           /* cumulative 8-bit; the fabric diffs mod 256 */
     c->frames++;
 }
@@ -187,6 +220,36 @@ void s573_core_note_idle(s573_core_t *c)
 uint16_t s573_core_ctrl_events(const s573_core_t *c)
 {
     return (uint16_t)(((uint16_t)c->sync_cnt << 8) | c->idle_cnt);
+}
+
+void s573_core_credit_drained(s573_core_t *c)
+{
+    /* 16-bit LAPPING subtraction, same as pcm_free: pcm_rd carries a wrap MSB
+     * and a plain compare would go backwards once per lap. */
+    uint16_t delta = (uint16_t)(c->pcm_rd - c->cq_last_rd);
+    c->cq_last_rd = c->pcm_rd;
+    c->cq_drained += delta;
+
+    /* Pay out every frame whose PCM has fully left the ring. Partial frames wait:
+     * one frame of granularity is ~26 ms against the 1.473 s of decode-ahead this
+     * removes, and holding to whole frames keeps cons_bytes exactly equal to the
+     * bytes those frames consumed. */
+    while (c->cq_head != c->cq_tail && c->cq_drained >= c->credit_q[c->cq_tail].beats)
+    {
+        c->cq_drained  -= c->credit_q[c->cq_tail].beats;
+        c->cons_bytes  += c->credit_q[c->cq_tail].bytes;
+        c->cq_tail      = (uint8_t)((c->cq_tail + 1u) % S573_CREDIT_Q);
+    }
+
+    /* Queue empty means the ring has been fully consumed, so nothing is left to
+     * wait for -- release any trailing bytes that never produced PCM (a window
+     * that ended mid-skip). Without this the last few bytes of a song would
+     * never be credited and the fabric would sit just short of the end. */
+    if (c->cq_head == c->cq_tail && c->cq_pending) {
+        c->cons_bytes += c->cq_pending;
+        c->cq_pending  = 0;
+        c->cq_drained  = 0;
+    }
 }
 
 uint16_t s573_core_credit_word(const s573_core_t *c)
