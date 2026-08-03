@@ -462,6 +462,49 @@ void psx_fill_blanksave(uint8_t *buffer, uint32_t lba, int cnt)
 static toc_t toc = {};
 #define CD_SECTOR_LEN 2352
 
+// Bytes a RAW MODE1/MODE2 sector spends on sync(12) + header(4) before the
+// payload. A COOKED track's frames carry the payload at offset 0 instead.
+#define CD_COOKED_HDR 16
+
+// Synthesize the sync + header a COOKED track does not store.
+//
+// WHY THIS EXISTS. A CHD track can be RAW (MODE1_RAW/MODE2_RAW, 2352 B/sector,
+// payload at byte 16) or COOKED (MODE1 2048 / MODE2 2336, payload at byte 0) --
+// mister_chd.cpp:118-134 records which. mister_chd_read_sector does a plain
+// memcpy and synthesizes nothing, so a cooked track reaches the core with its
+// payload 16 bytes early. A consumer that assumes RAW then reads every sector
+// shifted, which is silent and total: the ISO PVD's "CD001" signature lands out
+// of position and the disc looks unreadable rather than misaligned.
+//
+// Measured on the System 573 core: ddrsbm.chd (2352) boots; ddrs2k.chd (2048)
+// failed its BIOS CD check identically under every boot strap until its disc was
+// re-mastered to 2352 by hand. Normalizing here retires that workaround, so a
+// user never has to re-master their own dump.
+//
+// Main already states this rule from the other side, in its own ATAPI CD-ROM
+// path -- ide_cdrom.cpp:1051-1056, "if (sectorSize == 2048) hdr = 0;".
+//
+// Deliberately gated on sector_size ALONE, not on which core is running: the
+// property is intrinsic to the disc, and a core-specific gate here would be
+// invisible to every other CHD consumer that has the same assumption.
+static void psx_cook_hdr(uint8_t *buf, int lba, enum TrackType type)
+{
+	// 00 FF*10 00 -- the MODE1/MODE2 sync pattern.
+	static const uint8_t sync[12] = {
+		0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00
+	};
+	memcpy(buf, sync, sizeof(sync));
+
+	// The header carries the sector's PHYSICAL address as BCD min/sec/frame.
+	// `lba` is already physical: the core's LBA includes the fake 150-frame
+	// pregap that the caller subtracts to get the on-disc LBA, and physical MSF
+	// is exactly on-disc LBA + 150. So do NOT add 150 again here.
+	buf[12] = (uint8_t)((((lba / (60 * 75)) / 10) << 4) | ((lba / (60 * 75)) % 10));
+	buf[13] = (uint8_t)(((((lba / 75) % 60) / 10) << 4) | (((lba / 75) % 60) % 10));
+	buf[14] = (uint8_t)((((lba % 75) / 10) << 4) | ((lba % 75) % 10));
+	buf[15] = (type == TT_MODE2) ? 0x02 : 0x01;
+}
+
 int psx_chd_hunksize()
 {
 	if (toc.chd_f)
@@ -516,8 +559,19 @@ void psx_read_cd(uint8_t *buffer, int lba, int cnt)
 
 							// The "fake" 150 sector pregap moves all the LBAs up by 150, so adjust here to read where the core actually wants data from
 							int read_lba = lba - toc.tracks[0].indexes[1];
-							if (mister_chd_read_sector(toc.chd_f, (read_lba + toc.tracks[i].offset), 0, 0, CD_SECTOR_LEN, buffer, chd_hunkbuf, &chd_hunknum) == CHDERR_NONE)
+
+							// A COOKED track (MODE1 2048 / MODE2 2336) stores its payload at
+							// frame offset 0, with no sync+header. Land it at byte 16 and
+							// synthesize the missing 16 bytes, so every track we hand the core
+							// has the RAW layout regardless of how the dump was mastered.
+							// Audio is always 2352, so hdr stays 0 and the byteswap below is
+							// unaffected.
+							uint32_t hdr = (toc.tracks[i].sector_size &&
+							                toc.tracks[i].sector_size != CD_SECTOR_LEN) ? CD_COOKED_HDR : 0;
+
+							if (mister_chd_read_sector(toc.chd_f, (read_lba + toc.tracks[i].offset), hdr, 0, CD_SECTOR_LEN - hdr, buffer, chd_hunkbuf, &chd_hunknum) == CHDERR_NONE)
 							{
+								if (hdr) psx_cook_hdr(buffer, lba, toc.tracks[i].type);
 								if (!toc.tracks[i].type) //CHD requires byteswap of audio data
 								{
 									for (int swapidx = 0; swapidx < CD_SECTOR_LEN; swapidx += 2)
