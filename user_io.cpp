@@ -1001,7 +1001,15 @@ static void parse_config()
 					else
 					{
 						if (!is_c128()) user_io_set_index((user_io_ext_idx(str, ext) << 6) | idx);
-						user_io_file_mount(str, idx);
+						// See the S573_FLASH_* note in user_io.h. pre=1 so the image is
+						// CREATED on first write. This recall path runs at core init, before
+						// any .mgl item, so it is the one that matters on every boot after
+						// the first -- fixing only the .mgl mount would leave the common
+						// case still silently discarding writes.
+						if (is_573() && idx == S573_FLASH_SLOT)
+							user_io_file_mount(str, idx, 1, S573_FLASH_BYTES);
+						else
+							user_io_file_mount(str, idx);
 					}
 
 					if (!idx) boot0_mounted = 1;
@@ -3434,6 +3442,20 @@ void user_io_poll()
 								{
 									memcpy(buffer[disk], "HUBM\x00\x88\x10\x80", 8);
 								}
+							}
+							// MUST precede is_psx(). The 573 core's CONF_STR field 0 is
+							// literally "PSX;..." (it is a PlayStation derivative), so
+							// is_psx() is TRUE for it -- see the comment on is_573(), where
+							// the same confusion once silently disabled the MP3 service.
+							// Without this arm a freshly created slot-4 image would be
+							// pre-filled with a PlayStation MEMORY CARD header ("MC" at LBA
+							// 0, zeros after). Slot 4 on the 573 is 16 MB of NOR flash whose
+							// blank state is 0xFF, and the installer erases before it
+							// programs -- so a plausible-looking non-blank image is the
+							// hardest possible failure to spot.
+							else if (is_573())
+							{
+								memset(buffer[disk], 0xFF, sizeof(buffer[disk]));
 							}
 							else if (is_psx())
 							{

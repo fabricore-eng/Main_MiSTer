@@ -2789,7 +2789,14 @@ void HandleUI(void)
 			else
 			{
 				user_io_set_index(user_io_ext_idx(selPath, fs_pFileExt) << 6 | (menusub + 1));
-				user_io_file_mount(selPath, ioctl_index);
+				// See the S573_FLASH_* note in user_io.h. pre=1 so the image is CREATED
+				// on first write, which is what makes a first-ever CD install persist.
+				// This is the .mgl / OSD mount; the config-recall mount in user_io.cpp
+				// needs the same treatment and has it.
+				if (is_573() && ioctl_index == S573_FLASH_SLOT)
+					user_io_file_mount(selPath, ioctl_index, 1, S573_FLASH_BYTES);
+				else
+					user_io_file_mount(selPath, ioctl_index);
 			}
 
 			if (addon[0] == 'f' && addon[1] == '1') process_addon(addon, idx);
