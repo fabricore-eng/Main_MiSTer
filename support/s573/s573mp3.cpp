@@ -77,6 +77,7 @@ static struct
 	// that the data is bad, so we wait rather than skipping forward.
 	uint32_t         stall_polls;
 	int              warned_stall;
+	uint16_t         last_underrun;  // previous heartbeat's underrun_cnt, for the delta
 } s573;
 
 // How many consecutive no-progress polls to wait before stepping past the byte
@@ -113,6 +114,25 @@ static void ext_ctrl(uint16_t events, uint16_t flags, uint16_t *baselines)
 	spi_w(flags);
 	DisableIO();
 	if (baselines) *baselines = b;
+}
+
+// CMD_573_STATUS: fabric observability. Implemented in the fabric since the
+// transport was built and, until 2026-08-03, never once read -- so starvation was
+// unobservable from the HPS side even though the fabric was counting it.
+//
+// underrun_cnt is SATURATED to 16 bits on the way up (emu.sv:2737-2738), so
+// 0xFFFF means "instrument exhausted", not "65535". And it is CUMULATIVE with a
+// structural component: drain_en leads the write pointer by one poll at every
+// song start, so a couple of hundred at the top of a song is normal. Read it as a
+// DELTA across a mid-song window, never as an absolute.
+struct status_reply { uint16_t flags, underrun, buf_level; };
+
+static void ext_status(struct status_reply *st)
+{
+	st->flags     = spi_uio_cmd_cont(CMD_573_STATUS);
+	st->underrun  = spi_w(0);
+	st->buf_level = spi_w(0);
+	DisableIO();
 }
 
 // Reads the whole descramble tuple. All eight words come from ONE fabric-side
@@ -299,15 +319,28 @@ static void s573mp3_heartbeat(const s573_core_t *c, const struct ptrs_reply *r)
 	/* desc.cur is the ONLY way to see the enable-toggle rewind bug from outside:
 	 * on a pause/resume with no setup rewrite it must stay put, not snap back to
 	 * mp3_start. Printed relative to the window so a rewind is obvious by eye. */
+	/* Starvation is the reason the game-visible position register and real time
+	 * can drift apart, so it belongs on the same line as the pointers -- printed
+	 * as a DELTA since the previous heartbeat, which is the only reading that
+	 * means anything (see ext_status). */
+	struct status_reply st;
+	ext_status(&st);
+	uint16_t ur_delta = (st.underrun == 0xFFFFu) ? 0xFFFFu
+	                                             : (uint16_t)(st.underrun - s573.last_underrun);
+	s573.last_underrun = st.underrun;
+
 	printf("s573mp3: rst=%u/%u ack=%d cfg=%u/%u have=%d | cur=+%u/%u | in_len=%u pos=%u cons=%u "
-	       "| frames=%u sync=%u idle=%u | wr=%u rd=%u free=%u | ctrl=%04x echo_bad=%u\n",
+	       "| frames=%u sync=%u idle=%u | wr=%u rd=%u free=%u | ctrl=%04x echo_bad=%u "
+	       "| underrun=%u(+%u%s) buf=%u sflags=%04x\n",
 	       c->rst_epoch, r->rst_epoch, c->rst_acked, c->cfg_epoch, r->cfg_epoch, c->have_cfg,
 	       (unsigned)(c->desc.cur - c->desc.mp3_start),
 	       (unsigned)(c->desc.mp3_end - c->desc.mp3_start),
 	       c->in_len, c->in_pos, c->cons_bytes,
 	       c->frames, c->sync_cnt, c->idle_cnt,
 	       c->pcm_wr, c->pcm_rd, s573_core_pcm_free(c),
-	       c->ctrl_flags, c->ddrsbm_echo_bad);
+	       c->ctrl_flags, c->ddrsbm_echo_bad,
+	       st.underrun, ur_delta, (st.underrun == 0xFFFFu) ? " SAT" : "",
+	       st.buf_level, st.flags);
 }
 
 // ---- the poll ----------------------------------------------------------------
