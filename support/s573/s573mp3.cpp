@@ -77,7 +77,15 @@ static struct
 	// that the data is bad, so we wait rather than skipping forward.
 	uint32_t         stall_polls;
 	int              warned_stall;
-	uint16_t         last_underrun;  // previous heartbeat's underrun_cnt, for the delta
+	uint32_t         last_underrun;  // previous heartbeat's underrun_cnt, for the delta
+	// Underrun count latched when the CURRENT song's config was adopted. The
+	// per-song delta is the whole measurement: every 44100 Hz sample-clock that
+	// found the buffer empty is one sample of audio that never played while the
+	// game's position register advanced anyway, so
+	//     desync_seconds = (underrun - song_underrun_base) / 44100
+	// EXACTLY. Zero across a song is not "probably fine", it is proof the chart
+	// and the audio advanced together sample for sample.
+	uint32_t         song_underrun_base;
 } s573;
 
 // How many consecutive no-progress polls to wait before stepping past the byte
@@ -125,13 +133,19 @@ static void ext_ctrl(uint16_t events, uint16_t flags, uint16_t *baselines)
 // structural component: drain_en leads the write pointer by one poll at every
 // song start, so a couple of hundred at the top of a song is normal. Read it as a
 // DELTA across a mid-song window, never as an absolute.
-struct status_reply { uint16_t flags, underrun, buf_level; };
+struct status_reply { uint16_t flags, buf_level; uint32_t underrun, ram_wr; };
 
 static void ext_status(struct status_reply *st)
 {
+	uint16_t lo, hi;
 	st->flags     = spi_uio_cmd_cont(CMD_573_STATUS);
-	st->underrun  = spi_w(0);
+	lo            = spi_w(0);
 	st->buf_level = spi_w(0);
+	hi            = spi_w(0);   // word3: high half of the same snapshot
+	st->underrun  = ((uint32_t)hi << 16) | lo;
+	lo            = spi_w(0);   // word4/5: the game's DIO-RAM write frontier
+	hi            = spi_w(0);
+	st->ram_wr    = ((uint32_t)hi << 16) | lo;
 	DisableIO();
 }
 
@@ -325,13 +339,18 @@ static void s573mp3_heartbeat(const s573_core_t *c, const struct ptrs_reply *r)
 	 * means anything (see ext_status). */
 	struct status_reply st;
 	ext_status(&st);
-	uint16_t ur_delta = (st.underrun == 0xFFFFu) ? 0xFFFFu
-	                                             : (uint16_t)(st.underrun - s573.last_underrun);
+	uint32_t ur_delta = st.underrun - s573.last_underrun;
 	s573.last_underrun = st.underrun;
+	/* song=N is the verdict field: underruns accrued since THIS song's config was
+	 * adopted, i.e. exactly how many 44100 Hz sample-clocks played silence while
+	 * the position register advanced regardless. song=0 for a whole song means the
+	 * chart and the audio cannot have drifted; anything else is a desync of
+	 * song/44100 seconds, which is the measurement rather than an impression. */
+	uint32_t ur_song = st.underrun - s573.song_underrun_base;
 
 	printf("s573mp3: rst=%u/%u ack=%d cfg=%u/%u have=%d | cur=+%u/%u | in_len=%u pos=%u cons=%u "
 	       "| frames=%u sync=%u idle=%u | wr=%u rd=%u free=%u | ctrl=%04x echo_bad=%u "
-	       "| underrun=%u(+%u%s) buf=%u sflags=%04x\n",
+	       "| underrun=%u(+%u) song=%u(%.3f s) buf=%u sflags=%04x | wr_ptr=%08x lead=%+d\n",
 	       c->rst_epoch, r->rst_epoch, c->rst_acked, c->cfg_epoch, r->cfg_epoch, c->have_cfg,
 	       (unsigned)(c->desc.cur - c->desc.mp3_start),
 	       (unsigned)(c->desc.mp3_end - c->desc.mp3_start),
@@ -339,8 +358,9 @@ static void s573mp3_heartbeat(const s573_core_t *c, const struct ptrs_reply *r)
 	       c->frames, c->sync_cnt, c->idle_cnt,
 	       c->pcm_wr, c->pcm_rd, s573_core_pcm_free(c),
 	       c->ctrl_flags, c->ddrsbm_echo_bad,
-	       st.underrun, ur_delta, (st.underrun == 0xFFFFu) ? " SAT" : "",
-	       st.buf_level, st.flags);
+	       st.underrun, ur_delta, ur_song, (double)ur_song / 44100.0,
+	       st.buf_level, st.flags,
+	       st.ram_wr, (int)((int64_t)st.ram_wr - (int64_t)c->desc.cur));
 }
 
 // ---- the poll ----------------------------------------------------------------
@@ -557,6 +577,15 @@ void s573mp3_poll()
 		// fpga_ctrl[14:13]). If those never clear, the drain never clears and the
 		// music plays on past the game's stop -- so log the RAW flags on every
 		// config adoption. One line per epoch move, not per poll.
+		/* Re-base the per-song underrun measurement HERE, at config adoption --
+		 * the moment the game hands us a new song window. Basing it anywhere
+		 * later (first decode, first drain) would fold the song's own start-up
+		 * starvation into the previous song's total and read as a clean run. */
+		{
+			struct status_reply st0;
+			ext_status(&st0);
+			s573.song_underrun_base = st0.underrun;
+		}
 		if (s573.hb_en)
 			printf("s573mp3: CFG epoch=%u flags=%04x (mp3_en=%d stream_en=%d ddrsbm=%d) start=%08x end=%08x\n",
 			       cfg.epoch, cfg.flags,
