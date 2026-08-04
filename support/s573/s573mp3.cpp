@@ -96,7 +96,22 @@ static struct
 	 * mp3_start. */
 	int              ep_open;
 	uint32_t         ep_t0, ep_cur0, ep_frames0, ep_start, ep_end;
+	/* PCM TAP. Captures EXACTLY the samples we hand the fabric, which is the one
+	 * artifact that answers "did WE play that?" without a capture card, an analog
+	 * path, or a guess about mechanism. Buffered in RAM and written out in one go
+	 * at the end: streaming it to the SD card would put write latency inside the
+	 * decode path and perturb the timing we are trying to measure. */
+	uint8_t         *dump_buf;
+	uint32_t         dump_cap, dump_len;
+	uint32_t         dump_t0, dump_win_start, dump_win_end, dump_cur0;
+	uint32_t         last_arm_check;
 } s573;
+
+/* 12 s of 44.1 kHz 16-bit stereo. Long enough to cover the fragment AND enough of
+ * the track after it to correlate the two against each other. */
+#define S573_DUMP_BYTES (44100u * 4u * 12u)
+#define S573_DUMP_ARM   "/media/fat/s573_pcm.arm"
+#define S573_DUMP_OUT   "/media/fat/s573_pcm.raw"
 
 // How many consecutive no-progress polls to wait before stepping past the byte
 // we are stuck on. Polls are ~5 ms, so this is ~1 s of patience -- far longer
@@ -285,6 +300,15 @@ static void pcm_write(const int16_t *pcm, uint32_t bytes)
 	uint32_t byte_off = ((uint32_t)s573.core.pcm_wr * 8u) & (S573_PCM_BYTES - 1);
 	const uint8_t *src = (const uint8_t *)pcm;
 
+	/* tap: same bytes, straight into the capture buffer */
+	if (s573.dump_buf && s573.dump_len < s573.dump_cap)
+	{
+		uint32_t take = s573.dump_cap - s573.dump_len;
+		if (take > bytes) take = bytes;
+		memcpy(s573.dump_buf + s573.dump_len, src, take);
+		s573.dump_len += take;
+	}
+
 	while (bytes)
 	{
 		uint32_t run = S573_PCM_BYTES - byte_off;
@@ -405,6 +429,48 @@ static void ep_close_now(const s573_core_t *c, const char *why)
 	       audio, wall, wall - audio, why);
 }
 
+/* Arm/flush the PCM tap. Armed by a TRIGGER FILE rather than an env var so it can
+ * be started mid-session -- the operator holds the core in the OSD just before the
+ * event, we touch the file, they resume, and the capture covers exactly the moment
+ * in question. An env var would have needed a restart, which loses both the paused
+ * position and the boot check that got us there. */
+static void dump_service(const s573_core_t *c)
+{
+	uint32_t now = now_ms();
+
+	if (!s573.dump_buf)
+	{
+		if (now - s573.last_arm_check < 500) return;
+		s573.last_arm_check = now;
+		if (access(S573_DUMP_ARM, F_OK) != 0) return;
+		unlink(S573_DUMP_ARM);                 /* one-shot */
+		s573.dump_buf = (uint8_t *)malloc(S573_DUMP_BYTES);
+		if (!s573.dump_buf) { printf("s573mp3: PCM TAP -- out of memory\n"); return; }
+		s573.dump_cap = S573_DUMP_BYTES;
+		s573.dump_len = 0;
+		s573.dump_t0  = now;
+		s573.dump_win_start = c->desc.mp3_start;
+		s573.dump_win_end   = c->desc.mp3_end;
+		s573.dump_cur0      = c->desc.cur;
+		printf("s573mp3: PCM TAP ARMED t=%u -- window %08x..%08x cur=%08x, capturing %.1f s\n",
+		       now, s573.dump_win_start, s573.dump_win_end, s573.dump_cur0,
+		       (double)S573_DUMP_BYTES / (44100.0 * 4.0));
+		return;
+	}
+
+	if (s573.dump_len < s573.dump_cap) return;  /* still filling */
+
+	FILE *f = fopen(S573_DUMP_OUT, "wb");
+	if (f) { fwrite(s573.dump_buf, 1, s573.dump_len, f); fclose(f); }
+	printf("s573mp3: PCM TAP DONE t=%u -- wrote %u bytes (%.3f s) to %s; "
+	       "armed at window %08x..%08x cur=%08x, now window %08x..%08x cur=%08x\n",
+	       now, s573.dump_len, (double)s573.dump_len / (44100.0 * 4.0), S573_DUMP_OUT,
+	       s573.dump_win_start, s573.dump_win_end, s573.dump_cur0,
+	       c->desc.mp3_start, c->desc.mp3_end, c->desc.cur);
+	free(s573.dump_buf);
+	s573.dump_buf = NULL; s573.dump_cap = s573.dump_len = 0;
+}
+
 // ---- the poll ----------------------------------------------------------------
 
 void s573mp3_poll()
@@ -419,6 +485,8 @@ void s573mp3_poll()
 	if (s573.active < 0) return;
 
 	s573_core_t *c = &s573.core;
+
+	dump_service(c);
 
 	// 1. pointer / epoch exchange. Anything we send is ignored by the fabric
 	//    until the reset epoch is acked, which is exactly what we want.
