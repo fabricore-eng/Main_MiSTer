@@ -86,6 +86,16 @@ static struct
 	// EXACTLY. Zero across a song is not "probably fine", it is proof the chart
 	// and the audio advanced together sample for sample.
 	uint32_t         song_underrun_base;
+	/* One PLAYBACK EPISODE = a contiguous stretch with the drain on. Tracked so the
+	 * log says WHICH BYTES were played, not just whether they arrived on time. The
+	 * remaining attract artifact produces no underrun at all -- correctly paced
+	 * audio that is the wrong audio -- so timing instrumentation cannot see it, and
+	 * an episode ledger can: a window played twice shows two episodes over the same
+	 * range, a stale window shows an episode on the OLD window after a new song
+	 * started, and a restart-from-the-top shows a second episode beginning at
+	 * mp3_start. */
+	int              ep_open;
+	uint32_t         ep_t0, ep_cur0, ep_frames0, ep_start, ep_end;
 } s573;
 
 // How many consecutive no-progress polls to wait before stepping past the byte
@@ -367,6 +377,34 @@ static void s573mp3_heartbeat(const s573_core_t *c, const struct ptrs_reply *r)
 	       st.ram_wr, (int)((int64_t)st.ram_wr - (int64_t)c->desc.cur));
 }
 
+// Open/close a playback episode. Closing prints the ledger line.
+static void ep_open_now(const s573_core_t *c)
+{
+	if (s573.ep_open) return;
+	s573.ep_open   = 1;
+	s573.ep_t0     = now_ms();
+	s573.ep_cur0   = c->desc.cur;
+	s573.ep_frames0 = c->frames;
+	s573.ep_start  = c->desc.mp3_start;
+	s573.ep_end    = c->desc.mp3_end;
+}
+
+static void ep_close_now(const s573_core_t *c, const char *why)
+{
+	if (!s573.ep_open) return;
+	s573.ep_open = 0;
+	if (!s573.hb_en) return;
+	uint32_t bytes  = (c->desc.cur > s573.ep_cur0) ? (c->desc.cur - s573.ep_cur0) : 0;
+	uint32_t frames = c->frames - s573.ep_frames0;
+	/* frames*1152/44100 is the EXACT audio length decoded -- no bitrate guess. */
+	double audio = (double)frames * 1152.0 / 44100.0;
+	double wall  = (double)(now_ms() - s573.ep_t0) / 1000.0;
+	printf("s573mp3: PLAYED -- window %08x..%08x bytes %08x..%08x (%u) "
+	       "audio %.3f s wall %.3f s drift %+.3f s [%s]\n",
+	       s573.ep_start, s573.ep_end, s573.ep_cur0, c->desc.cur, bytes,
+	       audio, wall, wall - audio, why);
+}
+
 // ---- the poll ----------------------------------------------------------------
 
 void s573mp3_poll()
@@ -459,7 +497,19 @@ void s573mp3_poll()
 		s573_cfg_t cfg;
 		ext_read_cfg(&cfg);
 		int drain_before = (c->ctrl_flags & S573_CTRL_DRAIN_EN) ? 1 : 0;
+		/* Close the episode BEFORE apply_cfg if the WINDOW is about to change --
+		 * afterwards desc.cur has been re-based and the ledger would report the new
+		 * window's range against the old window's playback. A window swap with the
+		 * drain left on is exactly the case that would otherwise be invisible. */
+		{
+			uint32_t nstart = ((uint32_t)cfg.start_hi << 16) | cfg.start_lo;
+			uint32_t nend   = ((uint32_t)cfg.end_hi   << 16) | cfg.end_lo;
+			if (s573.ep_open && (nstart != s573.ep_start || nend != s573.ep_end))
+				ep_close_now(c, "window swap");
+		}
 		int rearmed      = s573_core_apply_cfg(c, &cfg);
+		/* ...and reopen against the new window if the drain never dropped. */
+		if (!s573.ep_open && (c->ctrl_flags & S573_CTRL_DRAIN_EN)) ep_open_now(c);
 
 		/* A NEW WINDOW -- so the PCM still sitting in the ring belongs to a song we
 		 * are never going to play again. Arm a flush.
@@ -568,11 +618,15 @@ void s573mp3_poll()
 		 * This makes that directly countable. */
 		{
 			int drain_after = (c->ctrl_flags & S573_CTRL_DRAIN_EN) ? 1 : 0;
-			if (s573.hb_en && drain_after != drain_before)
-				printf("s573mp3: DRAIN %s via ENABLES (flags=%04x mp3_en=%d stream_en=%d)\n",
-				       drain_after ? "ON" : "OFF", cfg.flags,
-				       (int)!!(cfg.flags & S573_CFG_MP3_ENABLE),
-				       (int)!!(cfg.flags & S573_CFG_STREAM_ENABLE));
+			if (drain_after != drain_before)
+			{
+				if (s573.hb_en)
+					printf("s573mp3: DRAIN %s via ENABLES (flags=%04x mp3_en=%d stream_en=%d)\n",
+					       drain_after ? "ON" : "OFF", cfg.flags,
+					       (int)!!(cfg.flags & S573_CFG_MP3_ENABLE),
+					       (int)!!(cfg.flags & S573_CFG_STREAM_ENABLE));
+				if (drain_after) ep_open_now(c); else ep_close_now(c, "enables");
+			}
 		}
 		// gain_seen == 0: the game has not set a level yet -> unity, NOT mute.
 		s573.gain_l = cfg.gain_seen ? s573_core_gain_mult(cfg.gain_ll) : 1.0f;
@@ -599,8 +653,8 @@ void s573mp3_poll()
 			if (s573.hb_en)
 			{
 				uint32_t st = ((uint32_t)cfg.start_hi << 16) | cfg.start_lo;
-				printf("s573mp3: SONG START -- window %08x..%08x, writer at %08x (lead %+d)\n",
-				       st, ((uint32_t)cfg.end_hi << 16) | cfg.end_lo, st0.ram_wr,
+				printf("s573mp3: SONG START t=%u -- window %08x..%08x, writer at %08x (lead %+d)\n",
+				       now_ms(), st, ((uint32_t)cfg.end_hi << 16) | cfg.end_lo, st0.ram_wr,
 				       (int)((int64_t)st0.ram_wr - (int64_t)st));
 			}
 		}
@@ -850,6 +904,7 @@ void s573mp3_poll()
 		if (s573.hb_en)
 			printf("s573mp3: DRAIN OFF via EXHAUSTION -- window done (cur=%08x end=%08x) and ring drained, drain OFF\n",
 			       c->desc.cur, c->desc.mp3_end);
+		ep_close_now(c, "exhausted");
 	}
 
 	// 6. hand the fabric this poll's cumulative event counts + control flags
