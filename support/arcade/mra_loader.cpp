@@ -63,13 +63,14 @@ static int  nvram_idx  = 0;
 static int  nvram_size = 0;
 static char nvram_name[200] = {};
 
-// <disc> images to mount after the ROM data has been sent. Several because a core may
-// expose more than one drive slot, and multi-disc games are ordinary on optical hardware.
-#define kMaxDiscs 4
-static unsigned char disc_idx[kMaxDiscs]   = {};
-static char          disc_path[kMaxDiscs][kBigTextSize] = {};
-static int           disc_valid[kMaxDiscs] = {};   // bit0 = index seen, bit1 = path seen
-static int           disc_num = 0;
+// <image> elements to mount after the ROM data has been sent. Several, because a core may
+// expose more than one S-slot (disc + writable save is already two) and multi-disc games
+// are ordinary on optical hardware.
+#define kMaxImages 4
+static unsigned char image_idx[kMaxImages]   = {};
+static char          image_path[kMaxImages][kBigTextSize] = {};
+static int           image_valid[kMaxImages] = {};   // bit0 = index seen, bit1 = path seen
+static int           image_num = 0;
 
 void arcade_nvm_save()
 {
@@ -720,7 +721,7 @@ static int xml_send_rom(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, cons
 					nvram_size = strtoul(node->attributes[i].value, NULL, 0);
 				}
 
-				// <disc index="N" name="path/to/image.chd"/> -- mount a CD/disc image.
+				// <image index="N" name="path/to/image.chd"/> -- mount a CD/disc image.
 				//
 				// Arcade hardware from the mid-90s on is frequently disc-based (Konami
 				// System 573 and other CD-equipped boards), but MRA could previously only
@@ -742,19 +743,19 @@ static int xml_send_rom(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, cons
 				// existing cores need NO change to be mountable this way. Format-agnostic
 				// on purpose: whatever user_io_file_mount() accepts (CHD, CUE/BIN, ...)
 				// works, so this does not bake a container choice into the MRA schema.
-				if (!strcasecmp(node->tag, "disc") && disc_num < kMaxDiscs)
+				if (!strcasecmp(node->tag, "image") && image_num < kMaxImages)
 				{
 					if (!strcasecmp(node->attributes[i].name, "index"))
 					{
-						disc_idx[disc_num] = (unsigned char)strtoul(node->attributes[i].value, NULL, 0);
-						disc_valid[disc_num] |= 1;
+						image_idx[image_num] = (unsigned char)strtoul(node->attributes[i].value, NULL, 0);
+						image_valid[image_num] |= 1;
 					}
 					// "name" matches <part name=>/<rom zip=> phrasing; "path" is accepted as
 					// a synonym because .mgl spells the same idea that way.
 					if (!strcasecmp(node->attributes[i].name, "name") || !strcasecmp(node->attributes[i].name, "path"))
 					{
-						strcpyz(disc_path[disc_num], node->attributes[i].value);
-						disc_valid[disc_num] |= 2;
+						strcpyz(image_path[image_num], node->attributes[i].value);
+						image_valid[image_num] |= 2;
 					}
 				}
 
@@ -1008,22 +1009,22 @@ static int xml_send_rom(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, cons
 
 		if (!strcasecmp(node->tag, "nvram")) arcade_nvm_load();
 
-		// A complete <disc> closes the slot and advances. Both attributes are required:
+		// A complete <image> closes the slot and advances. Both attributes are required:
 		// an index with no path (or the reverse) is an authoring mistake, and silently
 		// half-mounting is worse than saying so -- MRA already warns loudly elsewhere.
-		if (!strcasecmp(node->tag, "disc"))
+		if (!strcasecmp(node->tag, "image"))
 		{
-			if (disc_num < kMaxDiscs)
+			if (image_num < kMaxImages)
 			{
-				if (disc_valid[disc_num] == 3) disc_num++;
+				if (image_valid[image_num] == 3) image_num++;
 				else
 				{
-					printf("arcade: <disc> ignored -- needs BOTH index and name/path (valid=%X)\n", disc_valid[disc_num]);
-					disc_valid[disc_num] = 0;
-					disc_path[disc_num][0] = 0;
+					printf("arcade: <image> ignored -- needs BOTH index and name/path (valid=%X)\n", image_valid[image_num]);
+					image_valid[image_num] = 0;
+					image_path[image_num][0] = 0;
 				}
 			}
-			else printf("arcade: <disc> ignored -- more than %d discs\n", kMaxDiscs);
+			else printf("arcade: <image> ignored -- more than %d discs\n", kMaxImages);
 		}
 
 		if (!strcasecmp(node->tag, "switches"))
@@ -1208,10 +1209,10 @@ int arcade_send_rom(const char *xml)
 
 	// Discs are per-launch state: clear before parsing so a second .mra in the same
 	// session cannot inherit the previous game's images.
-	disc_num = 0;
-	memset(disc_idx,   0, sizeof(disc_idx));
-	memset(disc_valid, 0, sizeof(disc_valid));
-	memset(disc_path,  0, sizeof(disc_path));
+	image_num = 0;
+	memset(image_idx,   0, sizeof(image_idx));
+	memset(image_valid, 0, sizeof(image_valid));
+	memset(image_path,  0, sizeof(image_path));
 
 	SAX_Callbacks sax;
 	SAX_Callbacks_init(&sax);
@@ -1251,36 +1252,41 @@ int arcade_send_rom(const char *xml)
 	switches.dip_saved = switches.dip_cur;
 	arcade_sw_send();
 
-	// Mount <disc> images LAST: after every <rom> has streamed and after the DIPs are in
+	// Mount <image> images LAST: after every <rom> has streamed and after the DIPs are in
 	// place. Order matters on real hardware -- a disc-based board reads its straps and
 	// boots its BIOS before it ever touches the drive, and a core that samples a strap at
 	// reset would latch the wrong value if the mount raced the switch send.
-	arcade_disc_mount();
+	arcade_image_mount();
 	return 0;
 }
 
-// Mount whatever <disc> elements the .mra declared. Paths are taken relative to the
+// Mount whatever <image> elements the .mra declared. Paths are taken relative to the
 // games directory (the same place the OSD browser starts) unless absolute, so an .mra can
 // say name="System573/ddrsbm.chd" and stay portable across installs.
-void arcade_disc_mount()
+void arcade_image_mount()
 {
-	for (int i = 0; i < disc_num; i++)
+	for (int i = 0; i < image_num; i++)
 	{
 		char path[kBigTextSize * 2];
-		if (disc_path[i][0] == '/') snprintf(path, sizeof(path), "%s", disc_path[i]);
-		else snprintf(path, sizeof(path), "%s/%s", HomeDir(), disc_path[i]);
+		if (image_path[i][0] == '/') snprintf(path, sizeof(path), "%s", image_path[i]);
+		else snprintf(path, sizeof(path), "%s/%s", HomeDir(), image_path[i]);
 
 		if (!FileExists(path))
 		{
-			// Loud, and naming the resolved path: "the game just doesn't boot" is the
-			// worst possible symptom for a missing disc, and the .mra author needs to see
-			// exactly where we looked.
-			printf("arcade: <disc> index %d NOT MOUNTED -- no such file: %s\n", disc_idx[i], path);
+			// NOT treated as an error, deliberately. An .mra may legitimately name an
+			// image that does not exist yet: a CD-install arcade game's writable onboard
+			// storage is absent until the install the user is about to run creates it.
+			// Refusing to launch there would break precisely the first-boot flow <image>
+			// exists to enable. A genuinely missing CD still fails visibly a moment later
+			// when the game cannot boot, and this line is what explains why -- so it names
+			// the RESOLVED path, since "the game just doesn't boot" is the worst possible
+			// symptom to debug without knowing where we looked.
+			printf("arcade: <image> index %d not mounted, file absent: %s\n", image_idx[i], path);
 			continue;
 		}
 
-		int ret = user_io_file_mount(path, disc_idx[i]);
-		printf("arcade: <disc> index %d %s: %s\n", disc_idx[i], ret ? "mounted" : "MOUNT FAILED", path);
+		int ret = user_io_file_mount(path, image_idx[i]);
+		printf("arcade: <image> index %d %s: %s\n", image_idx[i], ret ? "mounted" : "MOUNT FAILED", path);
 	}
 }
 

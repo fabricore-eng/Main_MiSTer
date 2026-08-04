@@ -76,10 +76,11 @@ int arcade_get_direction();
 
 void arcade_nvm_save();
 
-// Mount the <disc> images declared by the current .mra (CD-based arcade hardware --
-// System 573 and friends). Called at the end of arcade_send_rom(), after the ROM data
-// and the DIP switches, because a disc board reads its straps before it touches the drive.
-void arcade_disc_mount();
+// Mount the <image> elements declared by the current .mra: any image the core exposes as
+// an S-slot (a CD/CHD for disc-based arcade hardware, a writable save image, an HDD...).
+// Called at the end of arcade_send_rom(), after the ROM data and the DIP switches, because
+// a disc board reads its straps and boots its BIOS before it ever touches the drive.
+void arcade_image_mount();
 
 mgl_struct* mgl_parse(const char *xml);
 mgl_struct* mgl_get();
