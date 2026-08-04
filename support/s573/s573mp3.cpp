@@ -498,6 +498,29 @@ void s573mp3_poll()
 	ext_ptrs(c->pcm_wr, s573_core_credit_word(c), c->rst_epoch, &r);
 	c->pcm_rd = r.fab_pcm_rd;
 
+	/* INVERSION RECOVERY. If our write pointer has ended up BEHIND the fabric's
+	 * read pointer, occupancy is nonsense in both directions: we compute free=0
+	 * and stop decoding, and the fabric (since the occupancy guard landed in
+	 * s573_pcm_ring) computes "impossible" and stops reading. Both sides then
+	 * wait for the other forever -- measured on hardware as a whole attract track
+	 * playing silent, with underrun climbing exactly 88200 per 2 s heartbeat.
+	 *
+	 * That deadlock is the cost of the fabric guard, which is still right: the
+	 * old behaviour was to lap the ring and play ~3 s of stale audio instead.
+	 * The answer is to make the state recoverable rather than to un-guard it.
+	 * Whatever the ring holds in this state is meaningless, so resynchronise to
+	 * the reader and carry on -- and re-base the credit cursor with it, exactly
+	 * as a config adoption does, or the next drained-beats delta would be a
+	 * 65000-beat garbage value. */
+	if ((uint16_t)(c->pcm_wr - c->pcm_rd) >= S573_PCM_BEATS)
+	{
+		printf("s573mp3: RING RESYNC -- write ptr was BEHIND the reader "
+		       "(wr=%u rd=%u, %u beats behind); snapping to the reader\n",
+		       c->pcm_wr, c->pcm_rd, (unsigned)(uint16_t)(c->pcm_rd - c->pcm_wr));
+		c->pcm_wr     = c->pcm_rd;      /* ring empty, both sides agree */
+		c->cq_last_rd = c->pcm_rd;      /* credit cursor follows, no phantom delta */
+	}
+
 	// Advance the PLAYBACK credit to the read cursor we just learned. This is what
 	// makes the game's chart follow the speaker instead of the decoder -- see the
 	// credit-pacing note in s573mp3_core.h. It must run AFTER pcm_rd is refreshed
@@ -647,12 +670,21 @@ void s573mp3_poll()
 			//
 			// A live collapse is safe as long as we land AHEAD of where the reader
 			// can have reached -- see PCM_COLLAPSE_MARGIN.
-			uint16_t dropped = pcm_ring_collapse_m(
-				c, drain_before ? (uint16_t)PCM_COLLAPSE_MARGIN : 1u);
+			/* MARGIN ALWAYS, not only when the drain was already running.
+			 * `drain_before` describes the instant we SAMPLED the pointers, and
+			 * the very next thing this same config adoption does is turn the
+			 * drain ON -- so a margin-1 collapse lands one beat ahead of a reader
+			 * that is about to start moving, against a pcm_rd already up to a
+			 * poll old. Measured 2026-08-04: wr=5245 rd=5348, the write pointer
+			 * 103 beats BEHIND, which is ~4.7 ms -- one 5 ms poll of reader
+			 * travel, exactly this race. That inversion is what made the fabric
+			 * lap the ring and replay ~3 s of stale audio. 256 beats is >2x the
+			 * furthest a reader can travel between our snapshot and our write. */
+			uint16_t dropped = pcm_ring_collapse_m(c, (uint16_t)PCM_COLLAPSE_MARGIN);
 			if (s573.hb_en && dropped > 1)
 				printf("s573mp3: PCM FLUSH -- dropped %u undrained beats (%.3f s) from the previous song%s, wr=%u rd=%u\n",
 				       dropped, (double)dropped * 2.0 / 44100.0,
-				       drain_before ? " (live, margin 256)" : "",
+				       drain_before ? " (live)" : "",
 				       c->pcm_wr, c->pcm_rd);
 		}
 

@@ -527,7 +527,46 @@ int main(void)
             "be gated", (unsigned)pulled, (unsigned)whole);
     }
 
-    if (!fails) printf("RESULT: PASS (s573mp3_core, 14 groups)\n");
+    /* ---- T15: an inverted ring must be RECOVERABLE, not a deadlock ----------
+     * With the write pointer behind the reader, free-space math wraps and reports
+     * 0 ("no room"), so the HPS stops decoding -- and since the fabric's occupancy
+     * guard landed it also stops reading, because the occupancy is impossible.
+     * Both sides then wait for each other forever: measured on hardware as an
+     * entire attract track playing silent with underrun climbing 88200 per 2 s.
+     * pcm_free MUST report the jam (0) so nothing overwrites undrained PCM, and
+     * the service MUST be able to get out of it by resynchronising to the reader. */
+    {
+        s573_core_init(&c);
+        c.rst_acked = 1; s573_core_set_ctrl(&c, S573_CTRL_DRAIN_EN);
+        cfg = mkcfg(0x000, 0x3000, 11, 0);
+        s573_core_apply_cfg(&c, &cfg);
+
+        /* the exact hardware reading: wr 103 beats behind rd */
+        c.pcm_rd = 5348; c.pcm_wr = 5245;
+        CHK(s573_core_pcm_free(&c) == 0,
+            "T15: inverted ring must report NO room, got %u", s573_core_pcm_free(&c));
+        CHK(!s573_core_should_decode(&c, 1),
+            "T15: must not decode into an inverted ring");
+
+        /* the recovery the service performs: snap to the reader, re-base credit */
+        c.pcm_wr = c.pcm_rd; c.cq_last_rd = c.pcm_rd;
+        CHK(s573_core_pcm_free(&c) == S573_PCM_BEATS - 1,
+            "T15: after resync the ring must be fully free, got %u",
+            s573_core_pcm_free(&c));
+        CHK(s573_core_should_decode(&c, 1),
+            "T15: decoding must resume after the resync -- otherwise it is a deadlock");
+        /* and the credit pass must not fabricate a 65000-beat drained delta out
+         * of the inverted pointers -- cons_bytes is the observable it feeds */
+        {
+            uint32_t before = c.cons_bytes;
+            s573_core_credit_drained(&c);
+            CHK(c.cons_bytes == before,
+                "T15: resync leaked a phantom credit (%u -> %u)",
+                (unsigned)before, (unsigned)c.cons_bytes);
+        }
+    }
+
+    if (!fails) printf("RESULT: PASS (s573mp3_core, 15 groups)\n");
     else        printf("RESULT: FAIL (s573mp3_core, %d checks failed)\n", fails);
     return fails ? 1 : 0;
 }
