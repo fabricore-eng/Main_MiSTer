@@ -63,6 +63,14 @@ static int  nvram_idx  = 0;
 static int  nvram_size = 0;
 static char nvram_name[200] = {};
 
+// <disc> images to mount after the ROM data has been sent. Several because a core may
+// expose more than one drive slot, and multi-disc games are ordinary on optical hardware.
+#define kMaxDiscs 4
+static unsigned char disc_idx[kMaxDiscs]   = {};
+static char          disc_path[kMaxDiscs][kBigTextSize] = {};
+static int           disc_valid[kMaxDiscs] = {};   // bit0 = index seen, bit1 = path seen
+static int           disc_num = 0;
+
 void arcade_nvm_save()
 {
 	if(nvram_idx && nvram_size)
@@ -712,6 +720,44 @@ static int xml_send_rom(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, cons
 					nvram_size = strtoul(node->attributes[i].value, NULL, 0);
 				}
 
+				// <disc index="N" name="path/to/image.chd"/> -- mount a CD/disc image.
+				//
+				// Arcade hardware from the mid-90s on is frequently disc-based (Konami
+				// System 573 and other CD-equipped boards), but MRA could previously only
+				// describe ROM data: <rom> STREAMS bytes to the core at an index, which a
+				// disc fundamentally is not -- the core reads sectors on demand for the
+				// life of the session, so the image has to be MOUNTED, not sent. Without
+				// this a disc-based arcade game cannot be launched from an .mra at all and
+				// has to fall back to a .mgl, which never appears in the arcade menu.
+				//
+				// Deliberately thin: record index+path here, mount once at the end of
+				// arcade_send_rom() via user_io_file_mount() -- the same call the OSD file
+				// browser and .mgl already use. No new transport and no new state machine.
+				// (.mgl reaches that call by SIMULATING an OSD file pick: menu.cpp walks
+				// the submenu and fills selPath. An .mra already knows the exact path, so
+				// it can mount directly and skip all of that.)
+				//
+				// `index` is the core's S-slot index, matching the CONF_STR entry the core
+				// already declares for its drive (e.g. "S1,CUECHD,Load CD;" -> index 1), so
+				// existing cores need NO change to be mountable this way. Format-agnostic
+				// on purpose: whatever user_io_file_mount() accepts (CHD, CUE/BIN, ...)
+				// works, so this does not bake a container choice into the MRA schema.
+				if (!strcasecmp(node->tag, "disc") && disc_num < kMaxDiscs)
+				{
+					if (!strcasecmp(node->attributes[i].name, "index"))
+					{
+						disc_idx[disc_num] = (unsigned char)strtoul(node->attributes[i].value, NULL, 0);
+						disc_valid[disc_num] |= 1;
+					}
+					// "name" matches <part name=>/<rom zip=> phrasing; "path" is accepted as
+					// a synonym because .mgl spells the same idea that way.
+					if (!strcasecmp(node->attributes[i].name, "name") || !strcasecmp(node->attributes[i].name, "path"))
+					{
+						strcpyz(disc_path[disc_num], node->attributes[i].value);
+						disc_valid[disc_num] |= 2;
+					}
+				}
+
 				if (!strcasecmp(node->tag, "cheats"))
 				{
 					if (!strcasecmp(node->attributes[i].name, "size"))
@@ -962,6 +1008,24 @@ static int xml_send_rom(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, cons
 
 		if (!strcasecmp(node->tag, "nvram")) arcade_nvm_load();
 
+		// A complete <disc> closes the slot and advances. Both attributes are required:
+		// an index with no path (or the reverse) is an authoring mistake, and silently
+		// half-mounting is worse than saying so -- MRA already warns loudly elsewhere.
+		if (!strcasecmp(node->tag, "disc"))
+		{
+			if (disc_num < kMaxDiscs)
+			{
+				if (disc_valid[disc_num] == 3) disc_num++;
+				else
+				{
+					printf("arcade: <disc> ignored -- needs BOTH index and name/path (valid=%X)\n", disc_valid[disc_num]);
+					disc_valid[disc_num] = 0;
+					disc_path[disc_num][0] = 0;
+				}
+			}
+			else printf("arcade: <disc> ignored -- more than %d discs\n", kMaxDiscs);
+		}
+
 		if (!strcasecmp(node->tag, "switches"))
 		{
 			arc_info->insidesw = 0;
@@ -1142,6 +1206,13 @@ int arcade_send_rom(const char *xml)
 	ext = strcasestr(nvram_name, ".mra");
 	if (ext) strcpy(ext, ".nvm");
 
+	// Discs are per-launch state: clear before parsing so a second .mra in the same
+	// session cannot inherit the previous game's images.
+	disc_num = 0;
+	memset(disc_idx,   0, sizeof(disc_idx));
+	memset(disc_valid, 0, sizeof(disc_valid));
+	memset(disc_path,  0, sizeof(disc_path));
+
 	SAX_Callbacks sax;
 	SAX_Callbacks_init(&sax);
 
@@ -1179,7 +1250,38 @@ int arcade_send_rom(const char *xml)
 	arcade_sw_load();
 	switches.dip_saved = switches.dip_cur;
 	arcade_sw_send();
+
+	// Mount <disc> images LAST: after every <rom> has streamed and after the DIPs are in
+	// place. Order matters on real hardware -- a disc-based board reads its straps and
+	// boots its BIOS before it ever touches the drive, and a core that samples a strap at
+	// reset would latch the wrong value if the mount raced the switch send.
+	arcade_disc_mount();
 	return 0;
+}
+
+// Mount whatever <disc> elements the .mra declared. Paths are taken relative to the
+// games directory (the same place the OSD browser starts) unless absolute, so an .mra can
+// say name="System573/ddrsbm.chd" and stay portable across installs.
+void arcade_disc_mount()
+{
+	for (int i = 0; i < disc_num; i++)
+	{
+		char path[kBigTextSize * 2];
+		if (disc_path[i][0] == '/') snprintf(path, sizeof(path), "%s", disc_path[i]);
+		else snprintf(path, sizeof(path), "%s/%s", HomeDir(), disc_path[i]);
+
+		if (!FileExists(path))
+		{
+			// Loud, and naming the resolved path: "the game just doesn't boot" is the
+			// worst possible symptom for a missing disc, and the .mra author needs to see
+			// exactly where we looked.
+			printf("arcade: <disc> index %d NOT MOUNTED -- no such file: %s\n", disc_idx[i], path);
+			continue;
+		}
+
+		int ret = user_io_file_mount(path, disc_idx[i]);
+		printf("arcade: <disc> index %d %s: %s\n", disc_idx[i], ret ? "mounted" : "MOUNT FAILED", path);
+	}
 }
 
 void arcade_pre_parse(const char *xml)
@@ -1341,7 +1443,21 @@ static int scan_mgl(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, const in
 
 	case XML_EVENT_START_NODE:
 		if (!strcasecmp(node->tag, "mistergamedescription")) inside_mgl = 1;
-		else if (inside_mgl && mgl.count < (int)(sizeof(mgl.item) / sizeof(mgl.item[0])))
+		else if (inside_mgl && mgl.count >= (int)(sizeof(mgl.item) / sizeof(mgl.item[0])))
+		{
+			// Say so. Previously the condition below simply went false and every further
+			// item was discarded in silence, which is close to undiagnosable: the .mgl
+			// looks correct, the parse "succeeds", and the only symptom is that whatever
+			// the dropped items did never happens.
+			static int warned = 0;
+			if (!warned)
+			{
+				printf("MGL: TOO MANY ITEMS -- only the first %d are used, '%s' and everything after it are IGNORED\n",
+					(int)(sizeof(mgl.item) / sizeof(mgl.item[0])), node->tag);
+				warned = 1;
+			}
+		}
+		else if (inside_mgl)
 		{
 			if (!strcasecmp(node->tag, "file"))
 			{

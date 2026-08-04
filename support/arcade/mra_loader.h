@@ -45,11 +45,19 @@ struct mgl_item_struct
 	int  action;
 };
 
+// Raised from 6. Six was enough for a console .mgl (core + rom + a save slot), but a
+// disc-based arcade launch legitimately needs more: BIOS, NVRAM, two security-cassette
+// halves, the disc itself and a writable flash save is already six, before any reset item.
+// The old cap did not report the overflow -- scan_mgl() simply stopped recording once the
+// array was full, so items 7+ vanished with no log line and the failure surfaced much later
+// as "the save never rebound", which is expensive to trace back to a silently dropped item.
+#define kMglMaxItems 16
+
 struct mgl_struct
 {
 	int  count;
 	int  current;
-	mgl_item_struct item[6];
+	mgl_item_struct item[kMglMaxItems];
 	uint32_t timer;
 	int  state;
 	int  done;
@@ -67,6 +75,11 @@ bool arcade_is_vertical();
 int arcade_get_direction();
 
 void arcade_nvm_save();
+
+// Mount the <disc> images declared by the current .mra (CD-based arcade hardware --
+// System 573 and friends). Called at the end of arcade_send_rom(), after the ROM data
+// and the DIP switches, because a disc board reads its straps before it touches the drive.
+void arcade_disc_mount();
 
 mgl_struct* mgl_parse(const char *xml);
 mgl_struct* mgl_get();
