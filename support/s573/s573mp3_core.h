@@ -221,6 +221,10 @@ int s573_core_should_decode(const s573_core_t *c, uint16_t need_beats);
 
 /* Top up `in` from the DRAM window. Returns bytes added. */
 uint32_t s573_core_fill(s573_core_t *c, const uint8_t *dram);
+/* Fill, but never read past `limit` (absolute window address). Used to keep the
+ * decoder behind a writer that is still streaming into the current window; see
+ * the note on the definition. */
+uint32_t s573_core_fill_upto(s573_core_t *c, const uint8_t *dram, uint32_t limit);
 
 /* Mark `n` staged bytes as consumed by the decoder and add them to the
  * cumulative credit. Compacts the staging buffer. */

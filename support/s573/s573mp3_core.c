@@ -151,7 +151,32 @@ int s573_core_should_decode(const s573_core_t *c, uint16_t need_beats)
 
 uint32_t s573_core_fill(s573_core_t *c, const uint8_t *dram)
 {
-    uint32_t room, got;
+    /* No frontier known -> UNLIMITED, and deliberately not mp3_end: the
+     * descrambler holds a tail byte that it releases after cur has reached the
+     * window end, so clamping at mp3_end silently drops the window's last byte.
+     * Caught by T14; the window's own bound lives in s573_desc_pull. */
+    return s573_core_fill_upto(c, dram, 0xFFFFFFFFu);
+}
+
+/* Same, but never reads past `limit` (an ABSOLUTE window address).
+ *
+ * WHY THIS EXISTS -- measured on hardware 2026-08-03. We do not decode at real
+ * time: the loop runs while the PCM ring has space, and the ring is 32768 beats
+ * = 1.486 s, which at 128 kbps is ~23,776 bytes of MP3 demanded AT ONCE when a
+ * song starts. A song the game has preloaded does not care. A song the game is
+ * still streaming does: ddrs2k's attract track began with the writer only 12,288
+ * bytes into a 1,375,511-byte window, so the burst fill outran it inside the
+ * first ~20 KB, and we read the PREVIOUS song still resident in that region.
+ * Those stale bytes are valid MPEG (the dump showed ff fb 92 0c), so they decode
+ * and PLAY -- the audible fragment of the wrong song -- until the stale data
+ * stops lining up, at which point minimp3 refuses, the stall guard waits ~0.9 s
+ * and steps past, and the song resumes permanently offset.
+ *
+ * Clamping the READ is the whole fix: bytes the writer has not produced are not
+ * ours to interpret. */
+uint32_t s573_core_fill_upto(s573_core_t *c, const uint8_t *dram, uint32_t limit)
+{
+    uint32_t room, got, ahead;
 
     /* compact first so a partial frame never pins the buffer */
     if (c->in_pos) {
@@ -164,6 +189,12 @@ uint32_t s573_core_fill(s573_core_t *c, const uint8_t *dram)
 
     room = S573_IN_WINDOW - c->in_len;
     if (room > S573_IN_CHUNK) room = S573_IN_CHUNK;
+
+    /* clamp to the frontier. cur is where the next pull starts, so a cur at or
+     * past the limit means there is nothing legitimate to read yet -- return 0
+     * and let the caller wait, which is NOT a stall. */
+    ahead = (limit > c->desc.cur) ? (limit - c->desc.cur) : 0;
+    if (room > ahead) room = ahead;
     if (!room) return 0;
 
     got = (uint32_t)s573_desc_pull(&c->desc, dram, c->in + c->in_len, room);

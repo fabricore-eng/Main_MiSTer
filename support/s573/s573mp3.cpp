@@ -93,6 +93,10 @@ static struct
 // than the uploader's ~85 ms gap between 4 KB chunks, and short enough that a
 // genuinely corrupt byte degrades to a brief glitch instead of a hung song.
 #define S573_STALL_LIMIT 200u
+/* Largest MPEG-1 Layer III frame the 573 produces (128 kbps / 44.1 kHz, padded
+ * = 418 bytes) with room to spare. Below this we cannot have a whole frame, so
+ * a short buffer at the writer's edge means "wait", never "bad data". */
+#define S573_MIN_FRAME_BYTES 1024u
 
 static uint32_t now_ms()
 {
@@ -644,16 +648,45 @@ void s573mp3_poll()
 		return;
 	}
 
+	/* How far may we legitimately read this poll?
+	 *
+	 * ram_adr is wherever the game last pointed its DRAM writer, NOT a per-window
+	 * high-water mark, so it can only be trusted as a frontier when it actually
+	 * lands INSIDE the window being played. Measured both cases on hardware:
+	 * a streamed window has it inside and climbing (attract began at +12288 of a
+	 * 1,375,511-byte window), while a preloaded window has it parked somewhere
+	 * else entirely -- up to ~15 MB BELOW the window in one run, and ~3-13 MB
+	 * above it in another. An unconditional clamp would deadlock every preloaded
+	 * song on those readings, so the resident case reads freely, exactly as before.
+	 */
+	struct status_reply fr;
+	ext_status(&fr);
+	/* UNLIMITED for the resident case -- not mp3_end, which would clip the
+	 * descrambler's held tail byte (T14). */
+	uint32_t read_limit = 0xFFFFFFFFu;
+	int streaming = (fr.ram_wr >= c->desc.mp3_start && fr.ram_wr <= c->desc.mp3_end);
+	if (streaming) read_limit = fr.ram_wr;
+
 	while (s573_core_should_decode(c, BEATS_PER_FRAME))
 	{
 		mp3dec_frame_info_t info;
 		short pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
 		int samples;
 
-		s573_core_fill(c, (const uint8_t *)s573.dio);
+		s573_core_fill_upto(c, (const uint8_t *)s573.dio, read_limit);
 
 		uint32_t avail = c->in_len - c->in_pos;
-		if (!avail) break;                       // window exhausted
+		if (!avail) break;                       // window exhausted, or waiting for the writer
+
+		/* Caught up with a live writer: stop for this poll WITHOUT arming the
+		 * stall guard. Waiting for bytes that do not exist yet is correct
+		 * behaviour, not a fault, and counting it as a stall is what used to
+		 * make us step past and read the previous song out of that region. */
+		if (streaming && avail < S573_MIN_FRAME_BYTES && c->desc.cur >= read_limit)
+		{
+			s573.stall_polls = 0;
+			break;
+		}
 
 		samples = mp3dec_decode_frame(&s573.dec, c->in + c->in_pos, (int)avail,
 		                              pcm, &info);

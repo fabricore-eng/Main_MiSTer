@@ -445,7 +445,89 @@ int main(void)
         if (!ok) fails++;
     }
 
-    if (!fails) printf("RESULT: PASS (s573mp3_core, 13 groups)\n");
+    /* ---- T14: never read past a writer that is still streaming this window ----
+     * The bug this locks down: the decode loop runs while the PCM ring has space,
+     * and the ring is ~1.49 s (~23.8 KB of MP3), so a song start demands far more
+     * bytes at once than a live uploader has produced. ddrs2k's attract window
+     * began with the writer 12,288 bytes in; we read straight past it into the
+     * PREVIOUS song still resident there, decoded it (valid MPEG, so audible),
+     * and only stopped when the stale data stopped lining up.
+     * fill_upto must therefore hand back NOTHING beyond the frontier -- and must
+     * resume cleanly when the frontier advances, so a clamp cannot wedge a song. */
+    {
+        uint32_t win_start = 0x000, win_end = 0x3000, frontier = 0x400;
+        uint32_t pulled = 0, guard, whole = 0;
+
+        /* reference: what the UNCLAMPED path delivers for this window. Not
+         * (win_end - win_start) -- the descrambler releases a held tail byte, so
+         * the real length is whatever the unclamped reader produces. */
+        s573_core_init(&c);
+        c.rst_acked = 1; s573_core_set_ctrl(&c, S573_CTRL_DRAIN_EN);
+        cfg = mkcfg(win_start, win_end, 8, 0);
+        s573_core_apply_cfg(&c, &cfg);
+        for (guard = 0; guard < 1000; guard++) {
+            uint32_t avail;
+            s573_core_fill(&c, dram);
+            avail = c.in_len - c.in_pos;
+            if (!avail) break;
+            whole += avail;
+            s573_core_consume(&c, avail);
+        }
+
+        s573_core_init(&c);
+        c.rst_acked = 1; s573_core_set_ctrl(&c, S573_CTRL_DRAIN_EN);
+        cfg = mkcfg(win_start, win_end, 9, 0);
+        s573_core_apply_cfg(&c, &cfg);
+
+        /* drain everything the frontier permits */
+        for (guard = 0; guard < 1000; guard++) {
+            uint32_t avail;
+            s573_core_fill_upto(&c, dram, frontier);
+            avail = c.in_len - c.in_pos;
+            if (!avail) break;
+            pulled += avail;
+            s573_core_consume(&c, avail);
+        }
+        CHK(pulled == frontier - win_start,
+            "T14: read %u bytes with the writer at +%u -- must stop AT the frontier",
+            (unsigned)pulled, (unsigned)(frontier - win_start));
+        CHK(c.desc.cur == frontier,
+            "T14: cur ran to %08x past the frontier %08x", c.desc.cur, frontier);
+
+        /* the writer advances -> the rest must flow, with nothing skipped */
+        frontier = win_end;
+        for (guard = 0; guard < 1000; guard++) {
+            uint32_t avail;
+            s573_core_fill_upto(&c, dram, frontier);
+            avail = c.in_len - c.in_pos;
+            if (!avail) break;
+            pulled += avail;
+            s573_core_consume(&c, avail);
+        }
+        CHK(pulled == whole,
+            "T14: %u bytes total after the writer caught up, expected %u -- a clamp "
+            "must delay bytes, never drop them", (unsigned)pulled, (unsigned)whole);
+
+        /* a resident window (frontier == window end) must be unaffected */
+        s573_core_init(&c);
+        c.rst_acked = 1; s573_core_set_ctrl(&c, S573_CTRL_DRAIN_EN);
+        cfg = mkcfg(win_start, win_end, 10, 0);
+        s573_core_apply_cfg(&c, &cfg);
+        pulled = 0;
+        for (guard = 0; guard < 1000; guard++) {
+            uint32_t avail;
+            s573_core_fill(&c, dram);          /* the unclamped entry point */
+            avail = c.in_len - c.in_pos;
+            if (!avail) break;
+            pulled += avail;
+            s573_core_consume(&c, avail);
+        }
+        CHK(pulled == whole,
+            "T14: resident window delivered %u of %u -- the preloaded path must not "
+            "be gated", (unsigned)pulled, (unsigned)whole);
+    }
+
+    if (!fails) printf("RESULT: PASS (s573mp3_core, 14 groups)\n");
     else        printf("RESULT: FAIL (s573mp3_core, %d checks failed)\n", fails);
     return fails ? 1 : 0;
 }
