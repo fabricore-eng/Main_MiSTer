@@ -1274,18 +1274,56 @@ int arcade_send_rom(const char *xml)
 	return 0;
 }
 
-// Mount whatever <image> elements the .mra declared. Paths are taken relative to the
-// games directory (the same place the OSD browser starts) unless absolute, so an .mra can
-// say name="System573/ddrsbm.chd" and stay portable across installs.
+// Resolve a <disc>/<storage> path to something that exists, trying the plausible bases in
+// order. Relative paths are left relative: make_fullpath() already prefixes getRootDir().
+//
+//   absolute            -- used as-is
+//   games/<path>        -- PRIMARY. "relative to the games directory", so an .mra says
+//                          name="System573/ddrsbm.chd" and ".." reaches siblings of games/
+//                          the way an author expects ("../saves/System573/x.sav").
+//   <path>              -- already root-relative ("games/System573/x.chd", "saves/...").
+//   <core home>/<path>  -- next to the game's own data. This was the ONLY base before, and
+//                          it is kept so any .mra written against it still works.
+//
+// WHY THIS EXISTS. It used to resolve against HomeDir() alone, which is games/<setname> --
+// so the base documented two lines above never applied, and an author's only recourse was
+// ".." traversal whose required depth depended on an internal they cannot see. Caught by
+// putting ddrs2k.mra on hardware: <disc name="System573/ddrs2k.chd"> resolved to
+// games/ddrs2k/System573/ddrs2k.chd and reported MISSING, with the file sitting in
+// games/System573/ the whole time. The .mra was right; the resolver was not.
+static int resolve_image_path(const char *rel, char *out, size_t out_len)
+{
+	if (rel[0] == '/')
+	{
+		snprintf(out, out_len, "%s", rel);
+		return FileExists(out);
+	}
+
+	snprintf(out, out_len, "%s/%s", GAMES_DIR, rel);
+	if (FileExists(out)) return 1;
+
+	snprintf(out, out_len, "%s", rel);
+	if (FileExists(out)) return 1;
+
+	snprintf(out, out_len, "%s/%s", HomeDir(), rel);
+	if (FileExists(out)) return 1;
+
+	// Nothing matched. Leave `out` holding the PRIMARY candidate rather than the last one
+	// tried -- the diagnostic should name the path the author most likely meant, not an
+	// internal fallback they never wrote.
+	snprintf(out, out_len, "%s/%s", GAMES_DIR, rel);
+	return 0;
+}
+
+// Mount whatever <disc>/<storage> elements the .mra declared. See resolve_image_path() for
+// which bases a relative path is tried against.
 void arcade_image_mount()
 {
 	for (int i = 0; i < image_num; i++)
 	{
 		char path[kBigTextSize * 2];
-		if (image_path[i][0] == '/') snprintf(path, sizeof(path), "%s", image_path[i]);
-		else snprintf(path, sizeof(path), "%s/%s", HomeDir(), image_path[i]);
 
-		if (!FileExists(path))
+		if (!resolve_image_path(image_path[i], path, sizeof(path)))
 		{
 			if (image_required[i])
 			{
