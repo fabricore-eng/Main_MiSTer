@@ -76,10 +76,11 @@ int arcade_get_direction();
 
 void arcade_nvm_save();
 
-// Mount the <image> elements declared by the current .mra: any image the core exposes as
-// an S-slot (a CD/CHD for disc-based arcade hardware, a writable save image, an HDD...).
-// Called at the end of arcade_send_rom(), after the ROM data and the DIP switches, because
-// a disc board reads its straps and boots its BIOS before it ever touches the drive.
+// Mount the <disc> and <save> elements declared by the current .mra into the core's S-slots.
+// <disc> is read-only media the game reads (a CD/CHD on disc-based arcade hardware); <save>
+// is writable storage it persists to. They differ in whether a MISSING file is a fault.
+// Called at the end of arcade_send_rom(), after the ROM data and the DIP switches, because a
+// disc board reads its straps and boots its BIOS before it ever touches the drive.
 void arcade_image_mount();
 
 mgl_struct* mgl_parse(const char *xml);
