@@ -723,7 +723,7 @@ static int xml_send_rom(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, cons
 				}
 
 				// <disc index="N" name="game.chd"/>  -- read-only media the game reads
-				// <save index="N" name="game.sav"/>  -- writable storage the game persists to
+				// <storage index="N" name="game.sav"/>  -- writable storage the game persists to
 				//
 				// Arcade hardware from the mid-90s on is frequently disc-based (Konami System
 				// 573 and other CD-equipped boards), but MRA could previously only describe ROM
@@ -737,8 +737,8 @@ static int xml_send_rom(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, cons
 				// MISSING file must be handled -- and nothing else in the system records which is
 				// which, so this is the only place it can be said:
 				//   <disc> absent -> the game will not boot. User error, and actionable: say so.
-				//   <save> absent -> the NORMAL first-run state. The install the user is about to
-				//                    run is the thing that creates it. Must stay quiet.
+				//   <storage> absent -> the NORMAL first-run state. The install the user is about
+				//                       to run is what creates it. Must stay quiet.
 				// Collapsing both into one tag makes those two indistinguishable in the log,
 				// which is the difference between "your CHD is missing" and silence. It also
 				// matches how MRA already names things: <rom> and <nvram> are both "bytes at an
@@ -754,7 +754,7 @@ static int xml_send_rom(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, cons
 				// Format-agnostic: whatever user_io_file_mount() accepts (CHD, CUE/BIN, ...)
 				// works, so the schema does not bake in a container choice. Writability is NOT
 				// declared here -- user_io_file_mount() derives it from the file itself.
-				if ((!strcasecmp(node->tag, "disc") || !strcasecmp(node->tag, "save")) && image_num < kMaxImages)
+				if ((!strcasecmp(node->tag, "disc") || !strcasecmp(node->tag, "storage")) && image_num < kMaxImages)
 				{
 					image_required[image_num] = !strcasecmp(node->tag, "disc");
 
@@ -1025,7 +1025,7 @@ static int xml_send_rom(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, cons
 		// A complete <image> closes the slot and advances. Both attributes are required:
 		// an index with no path (or the reverse) is an authoring mistake, and silently
 		// half-mounting is worse than saying so -- MRA already warns loudly elsewhere.
-		if (!strcasecmp(node->tag, "disc") || !strcasecmp(node->tag, "save"))
+		if (!strcasecmp(node->tag, "disc") || !strcasecmp(node->tag, "storage"))
 		{
 			if (image_num < kMaxImages)
 			{
@@ -1297,16 +1297,16 @@ void arcade_image_mount()
 			}
 			else
 			{
-				// A <save> is storage the game WRITES. On a first run it legitimately does not
-				// exist yet -- the install the user is about to perform is what creates it.
+				// A <storage> is an image the game WRITES. On a first run it legitimately does
+				// not exist yet -- the install the user is about to perform is what creates it.
 				// This must not look like a fault, or every first boot reports a scary error.
-				printf("arcade: <save> index %d not present yet (first run): %s\n", image_idx[i], path);
+				printf("arcade: <storage> index %d not present yet (first run): %s\n", image_idx[i], path);
 			}
 			continue;
 		}
 
 		int ret = user_io_file_mount(path, image_idx[i]);
-		printf("arcade: <%s> index %d %s: %s\n", image_required[i] ? "disc" : "save", image_idx[i], ret ? "mounted" : "MOUNT FAILED", path);
+		printf("arcade: <%s> index %d %s: %s\n", image_required[i] ? "disc" : "storage", image_idx[i], ret ? "mounted" : "MOUNT FAILED", path);
 	}
 }
 
