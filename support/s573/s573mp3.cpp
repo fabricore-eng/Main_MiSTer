@@ -73,6 +73,8 @@ static struct
 	float            gain_r;       // (1.0 until the game sets one -- never boot muted)
 	uint32_t         last_hb;
 	uint16_t         last_refused;
+	uint32_t         last_opsig;    // newest two opcodes + the sticky play latch
+	uint32_t         last_trace;    // rate cap for the trace line
 	// Consecutive polls that decoded nothing. See the WRITER RACE note at the
 	// decode loop: a stall means we have caught up with the game's uploader, not
 	// that the data is bad, so we wait rather than skipping forward.
@@ -163,11 +165,24 @@ static void ext_ctrl(uint16_t events, uint16_t flags, uint16_t *baselines)
 // structural component: drain_en leads the write pointer by one poll at every
 // song start, so a couple of hundred at the top of a song is normal. Read it as a
 // DELTA across a mid-song window, never as an absolute.
-struct status_reply { uint16_t flags, buf_level; uint32_t underrun, ram_wr; };
+struct status_reply {
+	uint16_t flags, buf_level; uint32_t underrun, ram_wr;
+	// ATAPI CDB trace, words 6..11 of the same snapshot. cdb_ops holds the four
+	// newest DISTINCT opcodes, newest first -- distinct because the boot TOC walk
+	// alone is 142 READ TOCs and a plain ring would show nothing else.
+	uint16_t cdb_count;
+	uint8_t  cdb_ops[4];
+	uint8_t  play_seen, play_op;
+	uint16_t play_lba, play_end;
+	// Sticky per-source mixer activity {spu, mp3, cdda}: has each source ever driven
+	// a CHANGING sample. spu=0 means nothing is reaching the mixer at all, which
+	// makes every CD-DA reading moot -- that has to be ruled out first.
+	uint8_t  aud_spu, aud_mp3, aud_cdda;
+};
 
 static void ext_status(struct status_reply *st)
 {
-	uint16_t lo, hi;
+	uint16_t lo, hi, w;
 	st->flags     = spi_uio_cmd_cont(CMD_573_STATUS);
 	lo            = spi_w(0);
 	st->buf_level = spi_w(0);
@@ -176,6 +191,19 @@ static void ext_status(struct status_reply *st)
 	lo            = spi_w(0);   // word4/5: the game's DIO-RAM write frontier
 	hi            = spi_w(0);
 	st->ram_wr    = ((uint32_t)hi << 16) | lo;
+	st->cdb_count = spi_w(0);   // word6
+	w             = spi_w(0);   // word7: {op1, op0}
+	st->cdb_ops[0] = w & 0xFF; st->cdb_ops[1] = w >> 8;
+	w             = spi_w(0);   // word8: {op3, op2}
+	st->cdb_ops[2] = w & 0xFF; st->cdb_ops[3] = w >> 8;
+	w             = spi_w(0);   // word9: {aud_seen, play_seen, play_op}
+	st->play_op   = w & 0xFF;
+	st->play_seen = (w >> 8) & 1;
+	st->aud_spu   = (w >> 9)  & 1;
+	st->aud_mp3   = (w >> 10) & 1;
+	st->aud_cdda  = (w >> 11) & 1;
+	st->play_lba  = spi_w(0);   // word10
+	st->play_end  = spi_w(0);   // word11
 	DisableIO();
 }
 
@@ -493,14 +521,38 @@ void s573mp3_poll()
 		struct status_reply probe;
 		ext_status(&probe);
 		uint16_t top = probe.flags & 0xF000;
-		if (top != s573.last_refused) {
+		// Report on a change in EITHER the live transport nibble or the sticky CDB
+		// trace. Keying only on the nibble printed nothing at all for DrumMania
+		// (measured 2026-08-06): it sat at 0 through the whole boot and attract, which
+		// says the transport was idle every time it was sampled and says nothing about
+		// what the game asked for. The opcode window moves whenever the conversation
+		// does, so this now reports the conversation rather than one snapshot of it.
+		uint32_t opsig = ((uint32_t)probe.cdb_ops[0]) | ((uint32_t)probe.cdb_ops[1] << 8) |
+		                 ((uint32_t)probe.play_seen << 16) | ((uint32_t)probe.play_op << 17) |
+		                 ((uint32_t)probe.aud_spu << 25) | ((uint32_t)probe.aud_mp3 << 26) |
+		                 ((uint32_t)probe.aud_cdda << 27);
+		// Rate cap. The opcode window moves whenever the game alternates two commands,
+		// which at a 5 ms poll is up to 200 lines a second -- enough to bury the one
+		// line that matters. A play latch turning 1 is never dropped; everything else
+		// waits 100 ms, so a busy stream still reports ~10 times a second.
+		int urgent = probe.play_seen && !(s573.last_opsig & 0x10000);
+		if ((top != s573.last_refused || opsig != s573.last_opsig) &&
+		    (urgent || now - s573.last_trace >= 100)) {
 			s573.last_refused = top;
+			s573.last_opsig   = opsig;
+			s573.last_trace   = now;
 			// bit15 refused, 14 cdda playing, 13 pump asking for a sector, 12 fetching.
-			// Printed on every CHANGE, not just on a refusal: "playing went 0->1 and req
-			// stayed 0" is the reading that separates our bug from the game's silence.
-			printf("s573: cd flags=%04x  refused=%u playing=%u req=%u fetching=%u\n",
+			// ops are newest-first and DISTINCT, so "43 a8 25 5a" means the last thing
+			// the game did was a TOC walk after a read, not 142 TOCs in a row.
+			printf("s573: cd flags=%04x  refused=%u playing=%u req=%u fetching=%u | "
+			       "cdbs=%u ops=%02x %02x %02x %02x | play_seen=%u op=%02x %u..%u | "
+			       "aud spu=%u mp3=%u cdda=%u\n",
 			       probe.flags, !!(top & 0x8000), !!(top & 0x4000),
-			       !!(top & 0x2000), !!(top & 0x1000));
+			       !!(top & 0x2000), !!(top & 0x1000),
+			       probe.cdb_count,
+			       probe.cdb_ops[0], probe.cdb_ops[1], probe.cdb_ops[2], probe.cdb_ops[3],
+			       probe.play_seen, probe.play_op, probe.play_lba, probe.play_end,
+			       probe.aud_spu, probe.aud_mp3, probe.aud_cdda);
 		}
 	}
 	s573.last_poll = now;
