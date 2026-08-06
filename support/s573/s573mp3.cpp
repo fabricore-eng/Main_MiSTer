@@ -75,6 +75,8 @@ static struct
 	uint16_t         last_refused;
 	uint32_t         last_opsig;    // newest two opcodes + the sticky play latch
 	uint32_t         last_trace;    // rate cap for the trace line
+	int              seen_trace;    // a non-zero trace has been read at least once
+	uint32_t         torn_reads;    // all-zero tails dropped by the guard
 	// Consecutive polls that decoded nothing. See the WRITER RACE note at the
 	// decode loop: a stall means we have caught up with the game's uploader, not
 	// that the data is bad, so we wait rather than skipping forward.
@@ -532,6 +534,29 @@ void s573mp3_poll()
 	{
 		struct status_reply probe;
 		ext_status(&probe);
+
+		// TORN-READ GUARD, not a fix. Roughly every other poll came back with the whole
+		// trace tail zeroed -- cdb_count 0, opcodes 00, aud_seen 0 -- interleaved with
+		// self-consistent readings whose counters advanced monotonically (measured
+		// 2026-08-06: 65, 77, 78, 81, 91). A sticky latch cannot go back to 0 and a
+		// counter cannot un-count, so those replies are the exchange failing, not the
+		// fabric changing. The suspect is the framework delivering our command strobe
+		// with io_enable low (sys_top.v pulses io_strobe channel-agnostically), which
+		// skips the snapshot write; that is a fabric-side question and this is only the
+		// filter that stops the artifact from burying the signal.
+		// Deliberately one-directional: a reply is dropped ONLY when it is all-zero and
+		// we have already seen a non-zero count, so a genuine post-reset zero still
+		// reports (last_cdbs is cleared with the rest of the trace state).
+		if (probe.cdb_count == 0 && probe.cdb_ops[0] == 0 && !probe.aud_spu &&
+		    s573.seen_trace) {
+			s573.torn_reads++;
+			if (s573.torn_reads == 1 || !(s573.torn_reads % 500))
+				printf("s573: trace read torn (all-zero tail) x%u -- reply dropped\n",
+				       s573.torn_reads);
+			probe.flags = 0xFFFF;   // sentinel: skip the report below, keep no state
+		}
+		else if (probe.cdb_count) s573.seen_trace = 1;
+
 		uint16_t top = probe.flags & 0xF000;
 		// Report on a change in EITHER the live transport nibble or the sticky CDB
 		// trace. Keying only on the nibble printed nothing at all for DrumMania
@@ -549,7 +574,8 @@ void s573mp3_poll()
 		// line that matters. A play latch turning 1 is never dropped; everything else
 		// waits 100 ms, so a busy stream still reports ~10 times a second.
 		int urgent = probe.play_seen && !(s573.last_opsig & 0x10000);
-		if ((top != s573.last_refused || opsig != s573.last_opsig) &&
+		if (probe.flags != 0xFFFF &&
+		    (top != s573.last_refused || opsig != s573.last_opsig) &&
 		    (urgent || now - s573.last_trace >= 100)) {
 			s573.last_refused = top;
 			s573.last_opsig   = opsig;
