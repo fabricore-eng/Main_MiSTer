@@ -178,7 +178,13 @@ struct status_reply {
 	// a CHANGING sample. spu=0 means nothing is reaching the mixer at all, which
 	// makes every CD-DA reading moot -- that has to be ruled out first.
 	uint8_t  aud_spu, aud_mp3, aud_cdda;
+	// The two newest COMPLETE CDBs. Opcodes alone got as far as "DrumMania loops
+	// MODE SELECT(10) and READ SUBCHANNEL and never plays"; which mode page it is
+	// selecting, and whether it asks for MSF or LBA sub-channel, are operand questions.
+	uint8_t  cdb[2][12];
 };
+
+static inline uint8_t st_cdb(const struct status_reply *st, int c, int b) { return st->cdb[c][b]; }
 
 static void ext_status(struct status_reply *st)
 {
@@ -204,6 +210,12 @@ static void ext_status(struct status_reply *st)
 	st->aud_cdda  = (w >> 11) & 1;
 	st->play_lba  = spi_w(0);   // word10
 	st->play_end  = spi_w(0);   // word11
+	for (int c = 0; c < 2; c++)          // words 12..17 newest, 18..23 the one before
+		for (int b = 0; b < 12; b += 2) {
+			w = spi_w(0);
+			st->cdb[c][b]     = w & 0xFF;
+			st->cdb[c][b + 1] = w >> 8;
+		}
 	DisableIO();
 }
 
@@ -530,7 +542,8 @@ void s573mp3_poll()
 		uint32_t opsig = ((uint32_t)probe.cdb_ops[0]) | ((uint32_t)probe.cdb_ops[1] << 8) |
 		                 ((uint32_t)probe.play_seen << 16) | ((uint32_t)probe.play_op << 17) |
 		                 ((uint32_t)probe.aud_spu << 25) | ((uint32_t)probe.aud_mp3 << 26) |
-		                 ((uint32_t)probe.aud_cdda << 27);
+		                 ((uint32_t)probe.aud_cdda << 27) ^
+		                 ((uint32_t)probe.cdb[0][1] << 18) ^ ((uint32_t)probe.cdb[0][2] << 20);
 		// Rate cap. The opcode window moves whenever the game alternates two commands,
 		// which at a 5 ms poll is up to 200 lines a second -- enough to bury the one
 		// line that matters. A play latch turning 1 is never dropped; everything else
@@ -544,15 +557,20 @@ void s573mp3_poll()
 			// bit15 refused, 14 cdda playing, 13 pump asking for a sector, 12 fetching.
 			// ops are newest-first and DISTINCT, so "43 a8 25 5a" means the last thing
 			// the game did was a TOC walk after a read, not 142 TOCs in a row.
+			char cdbs[2][40];
+			for (int c = 0; c < 2; c++) {
+				char *p = cdbs[c];
+				for (int b = 0; b < 12; b++) p += sprintf(p, "%02x ", st_cdb(&probe, c, b));
+			}
 			printf("s573: cd flags=%04x  refused=%u playing=%u req=%u fetching=%u | "
 			       "cdbs=%u ops=%02x %02x %02x %02x | play_seen=%u op=%02x %u..%u | "
-			       "aud spu=%u mp3=%u cdda=%u\n",
+			       "aud spu=%u mp3=%u cdda=%u | last=[%s] prev=[%s]\n",
 			       probe.flags, !!(top & 0x8000), !!(top & 0x4000),
 			       !!(top & 0x2000), !!(top & 0x1000),
 			       probe.cdb_count,
 			       probe.cdb_ops[0], probe.cdb_ops[1], probe.cdb_ops[2], probe.cdb_ops[3],
 			       probe.play_seen, probe.play_op, probe.play_lba, probe.play_end,
-			       probe.aud_spu, probe.aud_mp3, probe.aud_cdda);
+			       probe.aud_spu, probe.aud_mp3, probe.aud_cdda, cdbs[0], cdbs[1]);
 		}
 	}
 	s573.last_poll = now;
