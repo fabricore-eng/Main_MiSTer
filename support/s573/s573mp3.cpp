@@ -492,12 +492,15 @@ void s573mp3_poll()
 	{
 		struct status_reply probe;
 		ext_status(&probe);
-		uint16_t refused = probe.flags & 0xF000;
-		if (refused != s573.last_refused) {
-			s573.last_refused = refused;
-			if (refused & 0x8000)
-				printf("s573: ATAPI REFUSED a command -- opcode low bits %u (sflags=%04x)\n",
-				       (refused >> 12) & 7, probe.flags);
+		uint16_t top = probe.flags & 0xF000;
+		if (top != s573.last_refused) {
+			s573.last_refused = top;
+			// bit15 refused, 14 cdda playing, 13 pump asking for a sector, 12 fetching.
+			// Printed on every CHANGE, not just on a refusal: "playing went 0->1 and req
+			// stayed 0" is the reading that separates our bug from the game's silence.
+			printf("s573: cd flags=%04x  refused=%u playing=%u req=%u fetching=%u\n",
+			       probe.flags, !!(top & 0x8000), !!(top & 0x4000),
+			       !!(top & 0x2000), !!(top & 0x1000));
 		}
 	}
 	s573.last_poll = now;
