@@ -293,11 +293,28 @@ char is_573()
 	// function, so it silently never ran: no "s573mp3: service up" line, no audio,
 	// nothing else wrong. (Found 2026-07-31 on the first on-hardware MP3 test; the
 	// HPS host tests all pass because they exercise s573mp3_core.c, never this gate.)
-	// core_name IS 573-specific: it comes from the .mgl <setname>/.mra override
-	// ("System573"). Keep the orig_name arm too, so a future CONF_STR rename also works.
+	// core_name comes from the .mgl <setname>/.mra override. That was "System573" for the
+	// hand-written .mgl launchers, but a GENERATED .mra uses MAME's setname -- "drmn",
+	// "ddrs2k", one of 155 -- so on the whole arcade route BOTH of the original tests were
+	// false and this gate silently answered "no" again, in a new place. Measured 2026-08-06:
+	// DrumMania installed from an .mra and the install evaporated, because the flash slot is
+	// behind this gate. So is s573mp3_poll(), so is the 0xFF blank-flash fill.
+	//
+	// get_rbf_name() is the test that does not depend on how the core was launched: the .rbf
+	// is Konami_System_573.rbf whether an .mra, a .mgl, or the OSD file browser loaded it.
+	// The other two arms stay as fallbacks.
 	if (!is_573_type)
-		is_573_type = (!strncasecmp(orig_name, "Konami_System_573", 17)
-		            || !strncasecmp(core_name, "System573", 9)) ? 1 : 2;
+	{
+		const char *rbf = get_rbf_name();
+		// Never cache a NEGATIVE verdict before there is anything to judge. orig_name,
+		// core_name and core_path are all filled in as the core comes up, and a gate that
+		// latched "no" off three empty strings would stay wrong for the entire session --
+		// which is exactly the failure mode this comment block keeps documenting.
+		if (orig_name[0] || core_name[0] || rbf[0])
+			is_573_type = (!strncasecmp(orig_name, "Konami_System_573", 17)
+			            || !strncasecmp(core_name, "System573", 9)
+			            || !strncasecmp(rbf, "Konami_System_573", 17)) ? 1 : 2;
+	}
 	return (is_573_type == 1);
 }
 
