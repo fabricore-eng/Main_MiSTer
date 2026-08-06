@@ -15,6 +15,7 @@
 #include "../../shmem.h"
 #include "../../str_util.h"
 #include "../../cheats.h"
+#include "../psx/psx.h"
 
 #include "buffer.h"
 #include "mra_loader.h"
@@ -747,13 +748,17 @@ static int xml_send_rom(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, cons
 				// Main to remember a filename the USER picked in the browser, which is moot when
 				// an .mra states the path outright.)
 				//
-				// Both mount through user_io_file_mount() at the end of arcade_send_rom() -- the
-				// same call the OSD browser and .mgl already use. No new transport, no new state
-				// machine. `index` is the core's existing S-slot index from its own CONF_STR
-				// (e.g. "S1,CUECHD,Load CD;" -> 1), so no core needs changing to be mountable.
-				// Format-agnostic: whatever user_io_file_mount() accepts (CHD, CUE/BIN, ...)
-				// works, so the schema does not bake in a container choice. Writability is NOT
-				// declared here -- user_io_file_mount() derives it from the file itself.
+				// Both mount at the end of arcade_send_rom(), through the same calls the OSD
+				// browser and .mgl already use -- which is NOT one call. arcade_image_mount()
+				// reproduces menu.cpp's dispatch: a CD slot goes to psx.cpp so the image is
+				// decoded and its track table reaches the core, everything else takes the plain
+				// user_io_file_mount(). This comment used to claim the generic call covered both,
+				// and a 69-track disc is what proved it did not -- see arcade_image_mount().
+				// No new transport, no new state machine. `index` is the core's existing S-slot
+				// index from its own CONF_STR (e.g. "S1,CUECHD,Load CD;" -> 1), so no core needs
+				// changing to be mountable. Format-agnostic: whatever the mount path accepts
+				// (CHD, CUE/BIN, ...) works, so the schema does not bake in a container choice.
+				// Writability is NOT declared here -- the mount derives it from the file itself.
 				if ((!strcasecmp(node->tag, "disc") || !strcasecmp(node->tag, "storage")) && image_num < kMaxImages)
 				{
 					image_required[image_num] = !strcasecmp(node->tag, "disc");
@@ -1343,7 +1348,34 @@ void arcade_image_mount()
 			continue;
 		}
 
-		int ret = user_io_file_mount(path, image_idx[i]);
+		// A CD slot is not a flat image, and mounting it as one silently half-works.
+		//
+		// user_io_file_mount() opens the file raw. For a slot the core reads as a DISC that is
+		// wrong twice over: nothing decodes the CHD, and nothing sends the ioctl-251 disk_t that
+		// carries the track table. The .mgl/OSD route never had this problem because menu.cpp
+		// (MENU_GENERIC_IMAGE_SELECTED) intercepts slot 1 on a PSX-family core and calls into
+		// psx.cpp instead -- so the comment that used to sit on <disc>, claiming this was "the
+		// same call the OSD browser and .mgl already use", was simply not true, and that is the
+		// belief this bug was made of.
+		//
+		// Two things go wrong without the interception, and only the second one is loud:
+		//   * psx_read_cd() opens with `if (lba < toc.tracks[0].start || !toc.last)` -> every
+		//     sector reads back as zeros, because psx.cpp's toc was never populated.
+		//   * s573_cdtoc falls back to img_size/2352, reporting a ONE-track disc.
+		// A single-track disc survives the second one by luck, which is why ddrs2k looked fine
+		// and a 69-track DrumMania disc did not: the game asks for the TOC, is told there is one
+		// track, and never enumerates the other 68.
+		int ret;
+		if (is_psx() && image_idx[i] == 1)
+		{
+			// f_index mirrors menu.cpp's `ext_idx << 6 | slot`. An .mra names the file outright
+			// rather than picking it from an extension list, so ext_idx is 0 and the slot stands.
+			ret = psx_mount_cd_media(image_idx[i], image_idx[i], path);
+		}
+		else
+		{
+			ret = user_io_file_mount(path, image_idx[i]);
+		}
 		printf("arcade: <%s> index %d %s: %s\n", image_required[i] ? "disc" : "storage", image_idx[i], ret ? "mounted" : "MOUNT FAILED", path);
 	}
 }

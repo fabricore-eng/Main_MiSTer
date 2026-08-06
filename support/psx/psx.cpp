@@ -735,6 +735,41 @@ static int load_bios(const char* filename)
 	return user_io_file_tx(filename, 0xC0);
 }
 
+// Mount ONLY the media: decode the image, push the disc metadata, arm the sector slot.
+//
+// This is the subset of psx_mount_cd() below that an .mra needs, and it is deliberately a
+// separate function rather than a refactor of that one: the .mgl/OSD path is what gets played
+// every day, and it stays untouched.
+//
+// What is left out is left out on purpose. psx_mount_cd() wraps this media handling in the
+// PlayStation *console* conventions -- load cd_bios.rom out of the game directory, write a game
+// id, sniff a region off the Sony licence string in sector 154, and call psx_mount_save(), which
+// mounts a 128 KB MEMORY CARD image into slot 2. An .mra names its own BIOS, straps and storage
+// slots outright, so on that route those are at best redundant, and psx_mount_save() is actively
+// wrong: slot 2 may be a slot the .mra declared for itself, and it would be mounted over in silence.
+//
+// Region is reported UNKNOWN rather than probed. An arcade disc carries no Sony licence string,
+// so psx_get_region() would spend a disc read to return UNKNOWN anyway -- and it would spend it
+// BEFORE mount_cd(), reading through a slot that is not armed yet.
+int psx_mount_cd_media(int f_index, int s_index, const char *filename)
+{
+	if (strlen(filename) && load_cd_image(filename, &toc) && toc.last)
+	{
+		// reset=0: the .mra download sequence already holds the core in reset, and a disc
+		// appearing inside it is not the console-style "new game inserted" event that flag means.
+		send_cue_and_metadata(&toc, 0, region_t::UNKNOWN, 0);
+		user_io_set_index(f_index);
+		mount_cd(toc.end*CD_SECTOR_LEN, s_index);
+		return 1;
+	}
+
+	printf("psx: CD media mount FAILED (no decodable image / no tracks): %s\n", filename);
+	unload_cue(&toc);
+	unload_chd(&toc);
+	mount_cd(0, s_index);
+	return 0;
+}
+
 void psx_mount_cd(int f_index, int s_index, const char *filename)
 {
 	static char last_dir[1024] = {};
