@@ -72,6 +72,7 @@ static struct
 	float            gain_l;       // MAS3507D output gain, applied to decoded PCM
 	float            gain_r;       // (1.0 until the game sets one -- never boot muted)
 	uint32_t         last_hb;
+	uint16_t         last_refused;
 	// Consecutive polls that decoded nothing. See the WRITER RACE note at the
 	// decode loop: a stall means we have caught up with the game's uploader, not
 	// that the data is bad, so we wait rather than skipping forward.
@@ -479,6 +480,26 @@ void s573mp3_poll()
 
 	uint32_t now = now_ms();
 	if (now - s573.last_poll < 5) return;
+
+	// ATAPI refusal report, deliberately OUTSIDE the MP3 heartbeat. That heartbeat is
+	// gated on hb_en, which needs the MP3 transport configured -- and the titles this
+	// matters for are exactly the ones with no Digital I/O board, so it never prints
+	// for them. Edge-triggered, so it says its piece once instead of every 5 ms.
+	//
+	// bit15 = the drive refused an ATAPI command at all; 14:12 = the low three bits of
+	// that opcode, enough to separate the audio family (0x48 -> 0, 0x49 -> 1, 0xBC -> 4).
+	// "No music" is otherwise an inference; this makes it a reading.
+	{
+		struct status_reply probe;
+		ext_status(&probe);
+		uint16_t refused = probe.flags & 0xF000;
+		if (refused != s573.last_refused) {
+			s573.last_refused = refused;
+			if (refused & 0x8000)
+				printf("s573: ATAPI REFUSED a command -- opcode low bits %u (sflags=%04x)\n",
+				       (refused >> 12) & 7, probe.flags);
+		}
+	}
 	s573.last_poll = now;
 
 	if (!s573.active && !s573mp3_open()) { s573.active = -1; return; }
