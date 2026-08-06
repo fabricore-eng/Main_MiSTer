@@ -1328,24 +1328,40 @@ void arcade_image_mount()
 	{
 		char path[kBigTextSize * 2];
 
-		if (!resolve_image_path(image_path[i], path, sizeof(path)))
+		// On failure resolve_image_path() leaves `path` holding the PRIMARY candidate, which is
+		// also the path a first-run image should be CREATED at -- so a miss is still usable.
+		const int found = resolve_image_path(image_path[i], path, sizeof(path));
+
+		if (!found && image_required[i])
 		{
-			if (image_required[i])
-			{
-				// A <disc> is media the game reads to run. Absent, it will not boot, and the
-				// symptom ("it just hangs") points nowhere near the cause -- so say it loudly
-				// and name the RESOLVED path, which is the one piece of information the .mra
-				// author cannot guess.
-				printf("arcade: <disc> index %d MISSING -- the game will not boot: %s\n", image_idx[i], path);
-			}
-			else
-			{
-				// A <storage> is an image the game WRITES. On a first run it legitimately does
-				// not exist yet -- the install the user is about to perform is what creates it.
-				// This must not look like a fault, or every first boot reports a scary error.
-				printf("arcade: <storage> index %d not present yet (first run): %s\n", image_idx[i], path);
-			}
+			// A <disc> is media the game reads to run. Absent, it will not boot, and the
+			// symptom ("it just hangs") points nowhere near the cause -- so say it loudly
+			// and name the RESOLVED path, which is the one piece of information the .mra
+			// author cannot guess.
+			printf("arcade: <disc> index %d MISSING -- the game will not boot: %s\n", image_idx[i], path);
 			continue;
+		}
+
+		// A <storage> is an image the game WRITES, and on a first run it legitimately does not
+		// exist yet -- the install the user is about to perform is what creates it. That must
+		// not look like a fault, or every first boot reports a scary error.
+		//
+		// But "does not exist yet" is NOT a reason to skip the mount, which is what this used to
+		// do. The slot has to be ARMED for the installer to have anywhere to write; skipping it
+		// means a first-ever install writes into nothing and evaporates at power-off. Only the
+		// 573 flash slot can be armed from nothing, because it is the only one whose size is
+		// known here (S573_FLASH_BYTES); a generic <storage> has no size to create with, so a
+		// miss there still has to be skipped.
+		const int precreate = !found && is_573() && image_idx[i] == S573_FLASH_SLOT;
+
+		if (!found && !precreate)
+		{
+			printf("arcade: <storage> index %d not present yet (first run): %s\n", image_idx[i], path);
+			continue;
+		}
+		if (precreate)
+		{
+			printf("arcade: <storage> index %d not present yet -- arming it so the install persists: %s\n", image_idx[i], path);
 		}
 
 		// A CD slot is not a flat image, and mounting it as one silently half-works.
@@ -1371,6 +1387,15 @@ void arcade_image_mount()
 			// f_index mirrors menu.cpp's `ext_idx << 6 | slot`. An .mra names the file outright
 			// rather than picking it from an extension list, so ext_idx is 0 and the slot stands.
 			ret = psx_mount_cd_media(image_idx[i], image_idx[i], path);
+		}
+		else if (is_573() && image_idx[i] == S573_FLASH_SLOT)
+		{
+			// See the S573_FLASH_* note in user_io.h. pre=1 so the image is CREATED on first
+			// write, which is what makes a first-ever CD install persist -- without it the
+			// installer has nothing to write into and the install evaporates at power-off.
+			// menu.cpp (the .mgl/OSD mount) and user_io.cpp (the config-recall mount) both
+			// already do this; the arcade mount is the third site and was the one left out.
+			ret = user_io_file_mount(path, image_idx[i], 1, S573_FLASH_BYTES);
 		}
 		else
 		{
