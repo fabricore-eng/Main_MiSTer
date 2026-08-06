@@ -42,6 +42,10 @@
 #include "support.h"
 
 static char core_path[1024] = {};
+// The core's own CONF_STR, verbatim. Declared up here (not next to its reader) because
+// is_573() below needs it: it is the only 573 signal that does not depend on how the
+// core was launched.
+static char cfgstr[1024 * 10] = {};
 static char rbf_path[1024] = {};
 
 static fileTYPE sd_image[16] = {};
@@ -303,17 +307,23 @@ char is_573()
 	// get_rbf_name() is the test that does not depend on how the core was launched: the .rbf
 	// is Konami_System_573.rbf whether an .mra, a .mgl, or the OSD file browser loaded it.
 	// The other two arms stay as fallbacks.
-	if (!is_573_type)
+	// get_rbf_name() is NOT the answer either, though it reads like it: on an arcade launch
+	// core_path is set to the .mra path (user_io.cpp:1441, `xml ? xml : path`), so it returns
+	// "DrumMania (GQ881 VER. JAD).mra". Tried and measured on hardware 2026-08-06.
+	//
+	// The CONF_STR is. It is the core describing ITSELF, so it is identical no matter what
+	// launched it -- .mra, .mgl or the OSD browser -- and the 573 declares entries no stock
+	// PSX core has ("Load 573 BIOS", "573 Boot Device"). Two tokens, so a future edit to
+	// either one alone cannot silently switch this gate off again.
+	if (!is_573_type && cfgstr[0])
 	{
-		const char *rbf = get_rbf_name();
-		// Never cache a NEGATIVE verdict before there is anything to judge. orig_name,
-		// core_name and core_path are all filled in as the core comes up, and a gate that
-		// latched "no" off three empty strings would stay wrong for the entire session --
-		// which is exactly the failure mode this comment block keeps documenting.
-		if (orig_name[0] || core_name[0] || rbf[0])
-			is_573_type = (!strncasecmp(orig_name, "Konami_System_573", 17)
-			            || !strncasecmp(core_name, "System573", 9)
-			            || !strncasecmp(rbf, "Konami_System_573", 17)) ? 1 : 2;
+		// Only decide once the CONF_STR has actually been read (user_io_read_confstr).
+		// Latching a NEGATIVE verdict off an empty string before the core is up would be
+		// this exact bug for a fourth time.
+		is_573_type = (strstr(cfgstr, "Load 573 BIOS")
+		            || strstr(cfgstr, "573 Boot Device")
+		            || !strncasecmp(orig_name, "Konami_System_573", 17)
+		            || !strncasecmp(core_name, "System573", 9)) ? 1 : 2;
 	}
 	return (is_573_type == 1);
 }
@@ -2976,7 +2986,6 @@ int user_io_file_tx(const char* name, unsigned char index, char opensave, char m
 	return 1;
 }
 
-static char cfgstr[1024 * 10] = {};
 void user_io_read_confstr()
 {
 	spi_uio_cmd_cont(UIO_GET_STRING);
