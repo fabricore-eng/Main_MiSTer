@@ -67,9 +67,15 @@ static char nvram_name[200] = {};
 // <image> elements to mount after the ROM data has been sent. Several, because a core may
 // expose more than one S-slot (disc + writable save is already two) and multi-disc games
 // are ordinary on optical hardware.
-#define kMaxImages 4
+// 8, not 4: a System 573 title can declare four discs (install, install2, runtime,
+// multisession) alongside its writable flash, which is five -- and 4 silently dropped the
+// tail, which is the same class of bug as the old six-item .mgl cap.
+#define kMaxImages 8
+#define kMaxRole   16
+#define kSlotCount 16   // MiSTer S-slot indices are 4 bits (mount_cd: 1 << index)
 static unsigned char image_idx[kMaxImages]   = {};
 static char          image_path[kMaxImages][kBigTextSize] = {};
+static char          image_role[kMaxImages][kMaxRole] = {}; // MRA role= (MAME's disk region)
 static int           image_valid[kMaxImages] = {};   // bit0 = index seen, bit1 = path seen
 static int           image_required[kMaxImages] = {};// <disc> = must exist; <save> = may not yet
 static int           image_num = 0;
@@ -775,6 +781,14 @@ static int xml_send_rom(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, cons
 						strcpyz(image_path[image_num], node->attributes[i].value);
 						image_valid[image_num] |= 2;
 					}
+					// role= is MAME's disk region verbatim ("install", "runtime", "install2",
+					// "multisession"). Optional: an .mra that omits it, or any core that never
+					// heard of it, keeps the old single-disc behaviour. Not part of image_valid
+					// for exactly that reason -- a missing role must not invalidate the element.
+					if (!strcasecmp(node->attributes[i].name, "role"))
+					{
+						snprintf(image_role[image_num], kMaxRole, "%s", node->attributes[i].value);
+					}
 				}
 
 				if (!strcasecmp(node->tag, "cheats"))
@@ -1040,6 +1054,7 @@ static int xml_send_rom(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, cons
 					printf("arcade: <%s> ignored -- needs BOTH index and name/path (valid=%X)\n", node->tag, image_valid[image_num]);
 					image_valid[image_num] = 0;
 					image_path[image_num][0] = 0;
+					image_role[image_num][0] = 0;
 				}
 			}
 			else printf("arcade: <%s> ignored -- more than %d images\n", node->tag, kMaxImages);
@@ -1232,6 +1247,7 @@ int arcade_send_rom(const char *xml)
 	memset(image_valid, 0, sizeof(image_valid));
 	memset(image_required, 0, sizeof(image_required));
 	memset(image_path,  0, sizeof(image_path));
+	memset(image_role,  0, sizeof(image_role));
 
 	SAX_Callbacks sax;
 	SAX_Callbacks_init(&sax);
@@ -1322,11 +1338,82 @@ static int resolve_image_path(const char *rel, char *out, size_t out_len)
 
 // Mount whatever <disc>/<storage> elements the .mra declared. See resolve_image_path() for
 // which bases a relative path is tried against.
+// Which of several discs sharing a slot do we want? MAME's region tag says what each disc IS;
+// whether the game is installed yet says which one the cabinet would have in the drive. Higher
+// wins. A disc with no role= scores 0 and is only chosen if it is the sole candidate, so a
+// single-disc .mra behaves exactly as before.
+static int disc_rank(const char *role, int installed)
+{
+	if (installed)
+	{
+		// Installed: the operator has swapped to the disc that stays in during play.
+		if (!strcasecmp(role, "runtime"))      return 4;
+		if (!strcasecmp(role, "multisession")) return 3;
+		if (!strcasecmp(role, "install2"))     return 2;
+		if (!strcasecmp(role, "install"))      return 1;
+	}
+	else
+	{
+		// Not installed: the game needs its installer, which lives on the program disc.
+		if (!strcasecmp(role, "install"))      return 4;
+		if (!strcasecmp(role, "install2"))     return 3;
+		if (!strcasecmp(role, "runtime"))      return 2;   // sets that ship no install disc
+		if (!strcasecmp(role, "multisession")) return 1;
+	}
+	return 0;
+}
+
 void arcade_image_mount()
 {
+	// A 573 cabinet has ONE drive, so a multi-disc title is a disc SWAP, not two mounts. Pick
+	// the disc the operator would have in right now, so a first boot lands on the installer and
+	// every later boot lands on the game -- with no trip through the OSD. The OSD file browser
+	// on the CD slot still overrides this for anyone who wants a different disc.
+	//
+	// The signal is the <storage> save: it exists exactly when this game has been installed.
+	// That has to be decided in a PRE-PASS, because <disc> is emitted before <storage> and the
+	// answer is needed before the first mount.
+	int installed = 0;
+	for (int i = 0; i < image_num; i++)
+	{
+		char probe[kBigTextSize * 2];
+		if (!image_required[i] && resolve_image_path(image_path[i], probe, sizeof(probe)))
+		{
+			installed = 1;
+			break;
+		}
+	}
+
+	// Highest-ranked disc per slot index. Ties keep the first, which is MAME's own order.
+	// Indexed by the REAL slot number (MiSTer S-slots are 4 bits, see mount_cd's 1<<index),
+	// never a masked-down one -- masking would alias two distinct slots onto each other and
+	// silently drop one game's disc.
+	int chosen[kSlotCount];
+	for (int i = 0; i < kSlotCount; i++) chosen[i] = -1;
+	for (int i = 0; i < image_num; i++)
+	{
+		if (!image_required[i] || image_idx[i] >= kSlotCount) continue;
+		int slot = image_idx[i];
+		if (chosen[slot] < 0 ||
+		    disc_rank(image_role[i], installed) > disc_rank(image_role[chosen[slot]], installed))
+		{
+			chosen[slot] = i;
+		}
+	}
+
 	for (int i = 0; i < image_num; i++)
 	{
 		char path[kBigTextSize * 2];
+
+		// A disc that lost the pick is not an error and not a mount -- it is simply the disc
+		// that is out of the drive. Name it, so "why is it reading THAT one" is answerable.
+		if (image_required[i] && image_idx[i] < kSlotCount && chosen[image_idx[i]] != i)
+		{
+			printf("arcade: <disc> index %d not selected (role=%s, game %s): %s\n",
+			       image_idx[i], image_role[i][0] ? image_role[i] : "none",
+			       installed ? "installed" : "not installed yet", image_path[i]);
+			continue;
+		}
 
 		// On failure resolve_image_path() leaves `path` holding the PRIMARY candidate, which is
 		// also the path a first-run image should be CREATED at -- so a miss is still usable.
@@ -1401,7 +1488,16 @@ void arcade_image_mount()
 		{
 			ret = user_io_file_mount(path, image_idx[i]);
 		}
-		printf("arcade: <%s> index %d %s: %s\n", image_required[i] ? "disc" : "storage", image_idx[i], ret ? "mounted" : "MOUNT FAILED", path);
+		if (image_required[i] && image_role[i][0])
+		{
+			printf("arcade: <disc> index %d %s [role=%s, game %s]: %s\n", image_idx[i],
+			       ret ? "mounted" : "MOUNT FAILED", image_role[i],
+			       installed ? "installed" : "not installed yet", path);
+		}
+		else
+		{
+			printf("arcade: <%s> index %d %s: %s\n", image_required[i] ? "disc" : "storage", image_idx[i], ret ? "mounted" : "MOUNT FAILED", path);
+		}
 	}
 }
 
