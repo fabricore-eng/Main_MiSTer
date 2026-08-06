@@ -1439,16 +1439,26 @@ void arcade_image_mount()
 		// 573 flash slot can be armed from nothing, because it is the only one whose size is
 		// known here (S573_FLASH_BYTES); a generic <storage> has no size to create with, so a
 		// miss there still has to be skipped.
-		const int precreate = !found && is_573() && image_idx[i] == S573_FLASH_SLOT;
-
-		if (!found && !precreate)
+		// DO NOT arm a nonexistent flash slot. Tried it, and it breaks boot: mounting slot 4
+		// makes the core restore the whole 16 MB from the HPS, an absent file reads back as
+		// 0xFF, and that blank lands on top of the factory flash the .mra just preloaded at
+		// <rom index="2">. DrumMania then freezes on "START UP..." forever. Measured by A/B on
+		// hardware 2026-08-06: same .mra, same disc, only this arming differs -- armed gives
+		// START UP, not armed gives "DRUM MANIA INSTALLER / PLEASE PRESS THE TEST BUTTON".
+		//
+		// It is the ddrsbm flash-restore bug (docs/2026-07-31-ddrsbm-flash-restore-root-cause.md
+		// in the 573 repo) with the operands swapped: there a blank preload landed on a good
+		// slot-4 restore, here a blank slot-4 restore lands on a good preload.
+		//
+		// So a first-ever install still does not persist, and fixing that is NOT "mount it
+		// anyway": the slot has to be armed with the PRELOAD's contents, not with nothing, so
+		// the restore is a no-op and later writes stick. That means seeding the .sav from the
+		// assembled <rom index="2"> image at mount time. Real work, and it needs its own
+		// hardware test -- so it is written down rather than half-done here.
+		if (!found)
 		{
 			printf("arcade: <storage> index %d not present yet (first run): %s\n", image_idx[i], path);
 			continue;
-		}
-		if (precreate)
-		{
-			printf("arcade: <storage> index %d not present yet -- arming it so the install persists: %s\n", image_idx[i], path);
 		}
 
 		// A CD slot is not a flat image, and mounting it as one silently half-works.
@@ -1482,7 +1492,10 @@ void arcade_image_mount()
 			// installer has nothing to write into and the install evaporates at power-off.
 			// menu.cpp (the .mgl/OSD mount) and user_io.cpp (the config-recall mount) both
 			// already do this; the arcade mount is the third site and was the one left out.
-			ret = user_io_file_mount(path, image_idx[i], 1, S573_FLASH_BYTES);
+			// pre=1: user_io_file_mount returns 0 when it opened no EXISTING file, but it has
+			// still armed the slot ("Will be created upon write"). Only reached with an
+			// existing file today, but do not read that 0 as a failure if this changes.
+			ret = user_io_file_mount(path, image_idx[i], 1, S573_FLASH_BYTES) || 1;
 		}
 		else
 		{
