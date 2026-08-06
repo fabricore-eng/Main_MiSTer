@@ -341,8 +341,61 @@ static int rom_patch(const uint8_t *buf, int offset, uint16_t len, int dataop)
 	return 1;
 }
 
+
+// Defined further down with the other mount helpers; needed here by the flash seeding.
+static int resolve_image_path(const char *rel, char *out, size_t out_len);
+
+// Seed the writable flash image from the factory preload, once, on a first-ever run.
+//
+// A 573 .mra declares BOTH the factory flash at <rom index="2"> and a writable <storage> on the
+// flash slot. Those are the same 16 MB region, and on a first run they conflict: mounting the
+// storage makes the core restore all of it from the HPS, an absent file reads back 0xFF, and
+// that blank lands on the preload -- the game then freezes on "START UP..." (measured, and why
+// arcade_image_mount refuses to arm an absent slot).
+//
+// Writing the preload OUT to the storage path resolves it in the right direction. The restore
+// then reads back exactly what the preload already put there, so it is a no-op, and the slot is
+// a real file so the installer's writes land somewhere that survives a power cycle. It is also
+// what the hardware does: the flash chips ship with factory contents and the install overwrites
+// part of them.
+//
+// Only ever creates. An existing .sav is the user's install and is never touched.
+static void s573_seed_flash_save(const uint8_t *data, int len)
+{
+	for (int i = 0; i < image_num; i++)
+	{
+		if (image_required[i] || image_idx[i] != S573_FLASH_SLOT) continue;
+
+		char path[kBigTextSize * 2];
+		if (resolve_image_path(image_path[i], path, sizeof(path))) return;  // already installed
+
+		// Pad to the full chip size with 0xFF, the erased state -- a short seed would leave the
+		// tail as whatever the restore invents, and 0x00 is not blank on NOR flash.
+		uint8_t *img = (uint8_t *)malloc(S573_FLASH_BYTES);
+		if (!img) return;
+		memset(img, 0xFF, S573_FLASH_BYTES);
+		memcpy(img, data, (len < S573_FLASH_BYTES) ? len : S573_FLASH_BYTES);
+
+		char dir[kBigTextSize * 2];
+		snprintf(dir, sizeof(dir), "%s", path);
+		char *slash = strrchr(dir, '/');
+		if (slash) { *slash = 0; FileCreatePath(dir); }
+
+		int ok = FileSave(path, img, S573_FLASH_BYTES);
+		free(img);
+		printf("arcade: seeded <storage> index %d from the <rom index=2> preload (%d of %d bytes): %s%s\n",
+		       image_idx[i], (len < S573_FLASH_BYTES) ? len : S573_FLASH_BYTES, S573_FLASH_BYTES,
+		       path, ok ? "" : "  -- FAILED");
+		return;
+	}
+}
+
 static void rom_finish(int send, uint32_t address, int index)
 {
+	// BEFORE the send loop, which consumes romlen[0] as it streams.
+	if (romlen[0] && romdata && is_573() && romindex == S573_FLASH_PRELOAD_INDEX)
+		s573_seed_flash_save(romdata, romlen[0]);
+
 	if (romlen[0] && romdata)
 	{
 		if (send)

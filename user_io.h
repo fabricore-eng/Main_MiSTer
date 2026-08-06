@@ -196,6 +196,9 @@ int  user_io_file_mount(const char *name, unsigned char index = 0, char pre = 0,
 // INSTALLS ITSELF into (the disc is not "the game"; the installer programs the
 // flash and the machine then boots from it). The image therefore has to be
 // created on first use like a memory card, not assumed to exist.
+// ioctl index the .mra streams the FACTORY flash to (<rom index="2">), as against
+// S573_FLASH_SLOT which is the WRITABLE image. Same 16 MB region, two directions.
+#define S573_FLASH_PRELOAD_INDEX 2
 #define S573_FLASH_SLOT   4
 #define S573_FLASH_BYTES  (16*1024*1024)
 void user_io_bufferinvalidate(unsigned char index);
