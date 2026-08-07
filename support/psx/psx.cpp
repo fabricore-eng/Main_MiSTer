@@ -401,6 +401,14 @@ static const char* region_string(region_t region)
  * Triggered from s573mp3's poll when S573_CDINFO_REPEAT is set. */
 static disk_t s573_last_disk;
 static int    s573_have_disk = 0;
+static int    s573_last_mount_size = 0;   /* for s573_cdinfo_remount() */
+
+/* Replay the ENTIRE mount sequence -- blob then mount_cd -- with no core reload, so the
+ * one thing still unexplained can be watched: the blob sent just before the mount at core
+ * load does not stick, while an identical resend 8 s later does. Only ONE mount_cd fires
+ * at core load and it comes AFTER the blob (measured), so "more img_mounted pulses than
+ * blobs" is ruled out. This reproduces the real ordering on demand. */
+void s573_cdinfo_remount(void);
 
 void s573_cdinfo_resend(void)
 {
@@ -755,12 +763,43 @@ const char* psx_get_game_id()
 
 static void mount_cd(int size, int index)
 {
+	/* 573 DIAGNOSTIC 2026-08-07. Every call here produces one img_mounted pulse in the
+	 * fabric, and s573_cdtoc treats a pulse with nothing staged as "no metadata for this
+	 * disc" and falls back to a single data track. If mount_cd fires MORE times than the
+	 * blob is sent -- e.g. an unmount (size=0) followed by the real mount -- the first
+	 * pulse consumes the staged blob and the second resets track_count to 1. That would
+	 * explain exactly why the mount-time copy does not stick while an identical re-send
+	 * 8 s later does. Count and order them. */
+	printf("\x1b[32ms573: mount_cd size=%d index=%d\n\x1b[0m", size, index);
+	if (size && index == 1) s573_last_mount_size = size;
 	spi_uio_cmd_cont(UIO_SET_SDINFO);
 	spi32_w(size);
 	spi32_w(0);
 	DisableIO();
 	spi_uio_cmd8(UIO_SET_SDSTAT, (1 << index) | 0x80);
 	user_io_bufferinvalidate(1);
+
+	/* 573: re-send the disc metadata ONCE, immediately after the mount.
+	 *
+	 * MEASURED 2026-08-07: the blob sent just BEFORE the mount does not reach s573_cdtoc
+	 * -- the fabric answers READ TOC with last-track = 1 -- while a byte-identical send
+	 * moments later lands perfectly (257 word-writes captured, word 0 = 0x6945 = 69
+	 * tracks, addresses stepping cleanly by 4). Exactly one mount_cd fires at core load
+	 * and it comes AFTER the blob, so "more img_mounted pulses than blobs" is ruled out;
+	 * the early copy is simply swallowed.
+	 *
+	 * This is ONE-SHOT on purpose. The diagnostic that found the bug re-sent every 8 s,
+	 * and a repeating download -- let alone a repeating remount -- lands underneath a
+	 * running game and breaks it. Do not turn this into a loop. */
+	if (size && index == 1) s573_cdinfo_resend();
+}
+
+void s573_cdinfo_remount(void)
+{
+	if (!s573_have_disk || !s573_last_mount_size) return;
+	printf("\x1b[32ms573: REMOUNT seq -- blob then mount_cd size=%d\n\x1b[0m", s573_last_mount_size);
+	s573_cdinfo_resend();
+	mount_cd(s573_last_mount_size, 1);
 }
 
 static int load_bios(const char* filename)

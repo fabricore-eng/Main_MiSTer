@@ -41,7 +41,8 @@
 #include "../../fpga_io.h"
 #include "../../shmem.h"
 #include "s573mp3.h"
-extern void s573_cdinfo_resend(void);   /* support/psx/psx.cpp -- 573 diagnostic */
+extern void s573_cdinfo_resend(void);
+extern void s573_cdinfo_remount(void);
 
 extern "C" {
 #include "s573mp3_core.h"
@@ -651,11 +652,11 @@ void s573mp3_poll()
 	 * before an analyzer can be armed over JTAG -- and a no-fire would then be ambiguous
 	 * between "the decode never asserts" and "armed too late". No mount, no core reload,
 	 * identical ioctl-251 download. */
-	if (getenv("S573_CDINFO_REPEAT")) {
+	if (getenv("S573_CDINFO_REPEAT") || getenv("S573_REMOUNT_REPEAT")) {
 		static uint32_t s573_resend_at = 0;
 		if (!s573_resend_at || now - s573_resend_at >= 8000) {
 			s573_resend_at = now;
-			s573_cdinfo_resend();
+			if (getenv("S573_REMOUNT_REPEAT")) s573_cdinfo_remount(); else s573_cdinfo_resend();
 		}
 	}
 
