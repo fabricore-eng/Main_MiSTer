@@ -77,6 +77,8 @@ static struct
 	uint32_t         last_trace;    // rate cap for the trace line
 	int              seen_trace;    // a non-zero trace has been read at least once
 	uint32_t         torn_reads;    // all-zero tails dropped by the guard
+	uint16_t         last_cdb_count; // for the ordered per-CDB sequence log
+	int              seq_init;       // last_cdb_count is meaningful
 	// Consecutive polls that decoded nothing. See the WRITER RACE note at the
 	// decode loop: a stall means we have caught up with the game's uploader, not
 	// that the data is bad, so we wait rather than skipping forward.
@@ -556,6 +558,32 @@ void s573mp3_poll()
 			probe.flags = 0xFFFF;   // sentinel: skip the report below, keep no state
 		}
 		else if (probe.cdb_count) s573.seen_trace = 1;
+
+		// ---- ordered per-CDB sequence log (S573_CDB_SEQ=1) ----
+		// The rate-capped report below prints the CONVERSATION: it collapses while two
+		// opcodes alternate, and keeps only the 4 newest DISTINCT opcodes. That is why we
+		// could see MAME's full ordered stream and not our own, and it hid for a whole
+		// session that our 55/42 loop is the SAME loop MAME runs -- MAME's just escapes
+		// into PLAY AUDIO(10) after three iterations and ours does not. Order is the thing
+		// to compare, so log it: cdb_count ticks once per PACKET command, and the 5 ms poll
+		// outruns this game easily (247 commands in ~4 minutes).
+		// A skipped count is REPORTED, never silently smoothed -- a sequence with an
+		// unmarked hole is worse than no sequence, because it reads as complete.
+		static int seq_en = -1;
+		if (seq_en < 0) seq_en = getenv("S573_CDB_SEQ") ? 1 : 0;
+		if (seq_en && probe.flags != 0xFFFF && probe.cdb_count != s573.last_cdb_count) {
+			if (s573.seq_init) {
+				uint16_t gap = (uint16_t)(probe.cdb_count - s573.last_cdb_count);
+				if (gap > 1) printf("s573: seq GAP -- %u command(s) missed before #%u\n",
+				                    gap - 1, probe.cdb_count);
+			}
+			char c0[40]; char *p = c0;
+			for (int b = 0; b < 12; b++) p += sprintf(p, "%02x ", st_cdb(&probe, 0, b));
+			printf("s573: seq #%-5u %s| play_seen=%u aud spu=%u cdda=%u\n",
+			       probe.cdb_count, c0, probe.play_seen, probe.aud_spu, probe.aud_cdda);
+			s573.last_cdb_count = probe.cdb_count;
+			s573.seq_init = 1;
+		}
 
 		uint16_t top = probe.flags & 0xF000;
 		// Report on a change in EITHER the live transport nibble or the sticky CDB
