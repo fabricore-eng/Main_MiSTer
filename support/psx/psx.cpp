@@ -418,10 +418,18 @@ static void send_cue_and_metadata(toc_t *table, uint16_t libcrypt_mask, enum reg
 			disk->track[i].bcd = ((BCD(m) << 8) | BCD(s)) | ((table->tracks[i].type ? 0 : 1) << 16);
 		}
 
+		/* 573 DIAGNOSTIC 2026-08-07. The fabric's s573_cdtoc reports track_count=1 and
+		 * a lead-out that can ONLY have come from its img_size fallback -- i.e. NO
+		 * disk_t word ever reached it (any ti_write sets cdinfo_seen, which suppresses
+		 * that divider result). This says whether the blob leaves HERE, which splits
+		 * "Main never sends it" from "emu.sv's ioctl-251 routing drops it". */
+		printf("\x1b[32ms573: cdinfo TX index=251 bytes=%u track_count=%08x total_lba=%u\n\x1b[0m",
+		       (unsigned)sizeof(disk_t), disk->track_count, disk->total_lba);
 		user_io_set_index(251);
 		user_io_set_download(1);
 		user_io_file_tx_data((uint8_t *)disk, sizeof(disk_t));
 		user_io_set_download(0);
+		printf("\x1b[32ms573: cdinfo TX done\n\x1b[0m");
 		delete(disk);
 	}
 }

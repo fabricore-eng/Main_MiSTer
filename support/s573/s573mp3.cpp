@@ -214,12 +214,29 @@ static void ext_status(struct status_reply *st)
 	st->aud_cdda  = (w >> 11) & 1;
 	st->play_lba  = spi_w(0);   // word10
 	st->play_end  = spi_w(0);   // word11
-	for (int c = 0; c < 2; c++)          // words 12..17 newest, 18..23 the one before
-		for (int b = 0; b < 12; b += 2) {
-			w = spi_w(0);
-			st->cdb[c][b]     = w & 0xFF;
-			st->cdb[c][b + 1] = w >> 8;
-		}
+	/* MEASURED 2026-08-07, and this loop is OFF BY DEFAULT because of it.
+	 *
+	 * Reading 24 words breaks the transaction's own tail: with this loop compiled in,
+	 * STATUS words 10..23 ALL read back zero on hardware while words 6..9 out of the same
+	 * snapshot bank stay live and changing. tb_s573_hps_ext P5b walks all 24 words in
+	 * simulation and passes, so the fabric serves them -- the cap is above the RTL.
+	 *
+	 * The before/after is controlled and unambiguous: skipping this loop turned the
+	 * fabric's TOC witness from `0..0` into `1..46857` on the SAME core, unchanged. And
+	 * words 10/11 demonstrably worked at 10:07Z on core 7ec84d2 (a force-play printed
+	 * 59382..60695) -- before this loop was added. So the 12-word CDB tail is what killed
+	 * play_lba/play_endlba AND is why cdb_last/cdb_prev have never once been nonzero.
+	 *
+	 * Default is now the SHORT read, which keeps words 10/11 honest. S573_CDB_LONG=1
+	 * restores the tail for anyone investigating the cap itself. The real fix is to give
+	 * the CDB bytes their OWN transaction rather than a longer one -- not done yet. */
+	if (getenv("S573_CDB_LONG"))
+		for (int c = 0; c < 2; c++)          // words 12..17 newest, 18..23 the one before
+			for (int b = 0; b < 12; b += 2) {
+				w = spi_w(0);
+				st->cdb[c][b]     = w & 0xFF;
+				st->cdb[c][b + 1] = w >> 8;
+			}
 	DisableIO();
 }
 
