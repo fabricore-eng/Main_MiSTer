@@ -388,6 +388,31 @@ static const char* region_string(region_t region)
 
 #define BCD(v) ((uint8_t)((((v)/10) << 4) | ((v)%10)))
 
+/* 573 DIAGNOSTIC 2026-08-07 -- keep the last blob so it can be re-sent on demand.
+ *
+ * The fabric's cdinfo download-path SignalTap probe triggers on cdinfo_download, which
+ * asserts only during the disc mount at core load. Arming the analyzer over JTAG takes
+ * longer than that window, so the event is always already past -- and a no-fire would be
+ * ambiguous between "the decode never asserts" and "I armed too late", which is exactly
+ * the kind of silence that has misled this session twice today.
+ *
+ * s573_cdinfo_resend() re-runs the identical ioctl-251 download with no mount and no core
+ * reload, so the analyzer can be armed at leisure and the event produced underneath it.
+ * Triggered from s573mp3's poll when S573_CDINFO_REPEAT is set. */
+static disk_t s573_last_disk;
+static int    s573_have_disk = 0;
+
+void s573_cdinfo_resend(void)
+{
+	if (!s573_have_disk) return;
+	printf("\x1b[32ms573: cdinfo RESEND index=251 bytes=%u track_count=%08x\n\x1b[0m",
+	       (unsigned)sizeof(disk_t), s573_last_disk.track_count);
+	user_io_set_index(251);
+	user_io_set_download(1);
+	user_io_file_tx_data((uint8_t *)&s573_last_disk, sizeof(disk_t));
+	user_io_set_download(0);
+}
+
 static void send_cue_and_metadata(toc_t *table, uint16_t libcrypt_mask, enum region_t region, int reset)
 {
 	disk_t *disk = new disk_t;
@@ -425,6 +450,8 @@ static void send_cue_and_metadata(toc_t *table, uint16_t libcrypt_mask, enum reg
 		 * "Main never sends it" from "emu.sv's ioctl-251 routing drops it". */
 		printf("\x1b[32ms573: cdinfo TX index=251 bytes=%u track_count=%08x total_lba=%u\n\x1b[0m",
 		       (unsigned)sizeof(disk_t), disk->track_count, disk->total_lba);
+		memcpy(&s573_last_disk, disk, sizeof(disk_t));   /* for s573_cdinfo_resend() */
+		s573_have_disk = 1;
 		user_io_set_index(251);
 		user_io_set_download(1);
 		user_io_file_tx_data((uint8_t *)disk, sizeof(disk_t));

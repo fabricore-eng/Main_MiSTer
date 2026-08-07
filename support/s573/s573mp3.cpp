@@ -41,6 +41,7 @@
 #include "../../fpga_io.h"
 #include "../../shmem.h"
 #include "s573mp3.h"
+extern void s573_cdinfo_resend(void);   /* support/psx/psx.cpp -- 573 diagnostic */
 
 extern "C" {
 #include "s573mp3_core.h"
@@ -644,6 +645,20 @@ void s573mp3_poll()
 			       probe.aud_spu, probe.aud_mp3, probe.aud_cdda, cdbs[0], cdbs[1]);
 		}
 	}
+	/* 573 DIAGNOSTIC: re-send the cdinfo blob every ~8 s when S573_CDINFO_REPEAT is set,
+	 * so the fabric's cdinfo_download SignalTap trigger can be caught. That event
+	 * otherwise happens only during the disc mount at core load, which is over long
+	 * before an analyzer can be armed over JTAG -- and a no-fire would then be ambiguous
+	 * between "the decode never asserts" and "armed too late". No mount, no core reload,
+	 * identical ioctl-251 download. */
+	if (getenv("S573_CDINFO_REPEAT")) {
+		static uint32_t s573_resend_at = 0;
+		if (!s573_resend_at || now - s573_resend_at >= 8000) {
+			s573_resend_at = now;
+			s573_cdinfo_resend();
+		}
+	}
+
 	s573.last_poll = now;
 
 	if (!s573.active && !s573mp3_open()) { s573.active = -1; return; }
