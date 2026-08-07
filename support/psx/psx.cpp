@@ -465,6 +465,17 @@ static void send_cue_and_metadata(toc_t *table, uint16_t libcrypt_mask, enum reg
 		user_io_file_tx_data((uint8_t *)disk, sizeof(disk_t));
 		user_io_set_download(0);
 		printf("\x1b[32ms573: cdinfo TX done\n\x1b[0m");
+		/* 573 EXPERIMENT 2026-08-07: split "the FIRST send after core load is lost" from
+		 * "the mount eats it". S573_CDINFO_PRE2 repeats the send immediately, still BEFORE
+		 * mount_cd; pair with S573_CDINFO_NOPOST=1 so nothing lands after the mount.
+		 *   track_count 69 -> the first send is lost, the mount is innocent.
+		 *   track_count  1 -> the mount is the killer (more img_mounted pulses than the
+		 *                     s573_cdtoc arm can absorb). */
+		if (getenv("S573_CDINFO_PRE2")) {
+			const char *d = getenv("S573_CDINFO_PREDELAY");
+			if (d) usleep(atoi(d) * 1000);
+			s573_cdinfo_resend();
+		}
 		delete(disk);
 	}
 }
@@ -791,7 +802,7 @@ static void mount_cd(int size, int index)
 	 * This is ONE-SHOT on purpose. The diagnostic that found the bug re-sent every 8 s,
 	 * and a repeating download -- let alone a repeating remount -- lands underneath a
 	 * running game and breaks it. Do not turn this into a loop. */
-	if (size && index == 1) s573_cdinfo_resend();
+	if (size && index == 1 && !getenv("S573_CDINFO_NOPOST")) s573_cdinfo_resend();
 }
 
 void s573_cdinfo_remount(void)
