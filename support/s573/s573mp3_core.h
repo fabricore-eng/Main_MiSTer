@@ -261,6 +261,38 @@ void s573_core_credit_drained(s573_core_t *c);
 
 uint16_t s573_core_credit_word(const s573_core_t *c);
 
+
+/* ---- TRUE PLAY-AUDIO range, recovered from the CDB bytes -------------------
+ *
+ * The fabric's play_lba/play_endlba are the LOW 16 BITS of a 32-bit LBA and
+ * nothing more (s573_hps_ext.v:109 says so in words; atapi.v:712 does
+ * `play_lba <= cdda_start[15:0]`). Printed raw they are actively misleading: a
+ * play straddling a multiple of 65536 comes out with its END BELOW ITS START,
+ * which on 2026-08-08 was read as "this play crosses a 64K boundary" and became
+ * a standing lead for a bug. It is not an event, it is a wrap -- the observed
+ * rate (1 of 12 plays) is exactly the rate chance predicts (0.79 of 12) for the
+ * play lengths involved. Worse, a play at a true 294557..297483 prints as a
+ * placid-looking 32413..35339, so a wrapped field cannot be spotted by eye.
+ *
+ * PLAY AUDIO (10) carries the full start LBA in CDB bytes 2..5 and the length
+ * in bytes 7..8, and the CDB witness already ships those bytes -- so the true
+ * range was recoverable all along.
+ *
+ * The latch is caller-owned (no hidden statics: the point is that it is
+ * testable) and its result is VALIDATED rather than trusted. CDBs really are
+ * missed between polls -- the logs carry "seq GAP" lines -- and a stale latch
+ * printed against a newer play would be a new way to lie. The fabric's own
+ * truncated pair is the check: if the latch disagrees with it in the low 16
+ * bits, we report "not known" instead of guessing. */
+typedef struct { uint32_t lba, end; int have; } s573_play_latch_t;
+
+/* Update `l` from any PLAY AUDIO in `cdb` (slot 0 is the newer), then check it
+ * against the fabric's sticky low-16 pair. Returns 1 and fills out_lba/out_end
+ * with the TRUE 32-bit range when it can be proven, 0 when it cannot. */
+int s573_play_range(s573_play_latch_t *l, const uint8_t cdb[2][12],
+                    int play_seen, uint16_t lo_lba, uint16_t lo_end,
+                    uint32_t *out_lba, uint32_t *out_end);
+
 #ifdef __cplusplus
 }
 #endif

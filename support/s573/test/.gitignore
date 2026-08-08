@@ -1,2 +1,3 @@
-test_core
 *.o
+test_core
+test_play_range

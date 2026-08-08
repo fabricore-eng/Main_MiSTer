@@ -201,6 +201,7 @@ struct status_reply {
 
 static inline uint8_t st_cdb(const struct status_reply *st, int c, int b) { return st->cdb[c][b]; }
 
+
 static void ext_status(struct status_reply *st)
 {
 	uint16_t lo, hi, w;
@@ -713,14 +714,25 @@ void s573mp3_poll()
 				char *p = pagestr;
 				for (int b = 0; b < 14; b++) p += sprintf(p, "%02x ", page[b]);
 			}
+			// TRUE 32-bit play range where we can prove it, else the raw low-16 pair
+			// marked "lo16" so nobody reads a wrapped field as an LBA again.
+			static s573_play_latch_t play_latch;   // see s573mp3_core.h
+			uint32_t tr_lba, tr_end;
+			char playstr[48];
+			if (s573_play_range(&play_latch, probe.cdb, probe.play_seen,
+			                    probe.play_lba, probe.play_end, &tr_lba, &tr_end))
+				sprintf(playstr, "%u..%u", tr_lba, tr_end);
+			else
+				sprintf(playstr, "%u..%u(lo16)", probe.play_lba, probe.play_end);
+
 			printf("s573: cd flags=%04x  refused=%u playing=%u req=%u fetching=%u | "
-			       "cdbs=%u ops=%02x %02x %02x %02x | play_seen=%u op=%02x %u..%u | "
+			       "cdbs=%u ops=%02x %02x %02x %02x | play_seen=%u op=%02x %s | "
 			       "aud spu=%u mp3=%u cdda=%u | sec=%u/%u | last=[%s]%s page0e=[%s]\n",
 			       probe.flags, !!(top & 0x8000), !!(top & 0x4000),
 			       !!(top & 0x2000), !!(top & 0x1000),
 			       probe.cdb_count,
 			       probe.cdb_ops[0], probe.cdb_ops[1], probe.cdb_ops[2], probe.cdb_ops[3],
-			       probe.play_seen, probe.play_op, probe.play_lba, probe.play_end,
+			       probe.play_seen, probe.play_op, playstr,
 			       probe.aud_spu, probe.aud_mp3, probe.aud_cdda,
 			       sec_done, sec_abort,
 			       // "(SKEW)" means the CDB exchange saw a different cdb_count than the

@@ -295,3 +295,24 @@ float s573_core_gain_mult(uint32_t v)
     db = round(20.0 * log10(((double)0x100000 - (double)v) / (double)0x80000));
     return (float)pow(10.0, (db + 6.0) / 20.0);
 }
+
+int s573_play_range(s573_play_latch_t *l, const uint8_t cdb[2][12],
+                    int play_seen, uint16_t lo_lba, uint16_t lo_end,
+                    uint32_t *out_lba, uint32_t *out_end)
+{
+    int i;
+    for (i = 0; i < 2; i++) {                 /* slot 0 is the newer CDB */
+        uint32_t lba, len;
+        if (cdb[i][0] != 0x45) continue;      /* PLAY AUDIO (10) only */
+        lba = ((uint32_t)cdb[i][2] << 24) | ((uint32_t)cdb[i][3] << 16) |
+              ((uint32_t)cdb[i][4] <<  8) |  (uint32_t)cdb[i][5];
+        len = ((uint32_t)cdb[i][7] <<  8) |  (uint32_t)cdb[i][8];
+        if (!len) continue;                   /* a zero-length play tells us nothing */
+        l->lba = lba; l->end = lba + len - 1u; l->have = 1;
+        break;
+    }
+    *out_lba = l->lba; *out_end = l->end;
+    /* Agree with the fabric's low-16 view, or admit we do not know. */
+    return l->have && play_seen &&
+           (uint16_t)l->lba == lo_lba && (uint16_t)l->end == lo_end;
+}
