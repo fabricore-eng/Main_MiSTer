@@ -240,7 +240,9 @@ static void ext_status(struct status_reply *st)
 	 *
 	 * Default is now the SHORT read, which keeps words 10/11 honest. S573_CDB_LONG=1
 	 * restores the tail for anyone investigating the cap itself. The real fix is to give
-	 * the CDB bytes their OWN transaction rather than a longer one -- not done yet. */
+	 * the CDB bytes their OWN transaction rather than a longer one -- DONE 2026-08-08,
+	 * see ext_cdb() below and CMD_573_CDB. This long read stays only as the escape
+	 * hatch for anyone investigating the cap itself; it is still wrong by default. */
 	if (getenv("S573_CDB_LONG"))
 		for (int c = 0; c < 2; c++)          // words 12..17 newest, 18..23 the one before
 			for (int b = 0; b < 12; b += 2) {
@@ -249,6 +251,28 @@ static void ext_status(struct status_reply *st)
 				st->cdb[c][b + 1] = w >> 8;
 			}
 	DisableIO();
+}
+
+// Fetch the two newest whole CDBs on their own SHORT exchange (CMD_573_CDB).
+//
+// Word 0 answers cdb_count, and that is not decoration. This is a SECOND exchange,
+// so its snapshot is taken a beat later than the STATUS one; the caller compares the
+// two counts to know whether these bytes actually belong to the status it is about to
+// print. Printing a mismatched pair as though it were matched is exactly how a trace
+// starts lying, which is what this command exists to stop.
+//
+// Returns the fabric's cdb_count for that comparison.
+static uint16_t ext_cdb(struct status_reply *st)
+{
+	uint16_t cnt = spi_uio_cmd_cont(CMD_573_CDB);
+	for (int c = 0; c < 2; c++)
+		for (int b = 0; b < 12; b += 2) {
+			uint16_t w = spi_w(0);
+			st->cdb[c][b]     = w & 0xFF;
+			st->cdb[c][b + 1] = w >> 8;
+		}
+	DisableIO();
+	return cnt;
 }
 
 // Reads the whole descramble tuple. All eight words come from ONE fabric-side
@@ -562,8 +586,29 @@ void s573mp3_poll()
 	// that opcode, enough to separate the audio family (0x48 -> 0, 0x49 -> 1, 0xBC -> 4).
 	// "No music" is otherwise an inference; this makes it a reading.
 	{
-		struct status_reply probe;
+		// ZERO-INIT, and this is not a style preference. ext_status() fills cdb[][]
+		// only when the (default-off) long read is compiled in, so an uninitialised
+		// probe printed STACK GARBAGE in last=/prev= -- bytes that looked plausible
+		// enough to support a whole wrong theory that the CDB channel was "aliased to
+		// the audio sample buffer" (2026-08-08). It was aliased to nothing; it was
+		// never written. Unread must render as 00, never as convincing junk.
+		struct status_reply probe = {};
 		ext_status(&probe);
+
+		// Then the CDBs, on their own short exchange -- only when the trace is actually
+		// being printed. It is a second SPI round trip at a 5 ms poll and there is no
+		// reason to spend it when nobody is reading the output.
+		static int cdb_trace_en = -1;
+		if (cdb_trace_en < 0)
+			cdb_trace_en = (getenv("S573_CDB_SEQ") || getenv("S573_CDB_TRACE")) ? 1 : 0;
+		int cdb_valid = 0;
+		if (cdb_trace_en) {
+			uint16_t cdb_snap_cnt = ext_cdb(&probe);
+			// Same instant? If the count moved between the two exchanges then these
+			// bytes describe a different command than the counters do. Mark it rather
+			// than print a pair that merely looks matched.
+			cdb_valid = (cdb_snap_cnt == probe.cdb_count);
+		}
 
 		// TORN-READ GUARD, not a fix. Roughly every other poll came back with the whole
 		// trace tail zeroed -- cdb_count 0, opcodes 00, aud_seen 0 -- interleaved with
@@ -646,13 +691,17 @@ void s573mp3_poll()
 			}
 			printf("s573: cd flags=%04x  refused=%u playing=%u req=%u fetching=%u | "
 			       "cdbs=%u ops=%02x %02x %02x %02x | play_seen=%u op=%02x %u..%u | "
-			       "aud spu=%u mp3=%u cdda=%u | last=[%s] prev=[%s]\n",
+			       "aud spu=%u mp3=%u cdda=%u | last=[%s]%s prev=[%s]\n",
 			       probe.flags, !!(top & 0x8000), !!(top & 0x4000),
 			       !!(top & 0x2000), !!(top & 0x1000),
 			       probe.cdb_count,
 			       probe.cdb_ops[0], probe.cdb_ops[1], probe.cdb_ops[2], probe.cdb_ops[3],
 			       probe.play_seen, probe.play_op, probe.play_lba, probe.play_end,
-			       probe.aud_spu, probe.aud_mp3, probe.aud_cdda, cdbs[0], cdbs[1]);
+			       probe.aud_spu, probe.aud_mp3, probe.aud_cdda,
+			       // "(SKEW)" means the CDB exchange saw a different cdb_count than the
+			       // STATUS one -- the bytes and the counters describe different commands.
+			       // Never silently print such a pair as matched.
+			       cdbs[0], cdb_valid ? "" : "(SKEW)", cdbs[1]);
 		}
 	}
 	/* 573 DIAGNOSTIC: re-send the cdinfo blob every ~8 s when S573_CDINFO_REPEAT is set,

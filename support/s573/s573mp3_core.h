@@ -54,6 +54,16 @@ extern "C" {
 #define CMD_573_STATUS  0x69
 #define CMD_573_CTRL    0x6A
 #define CMD_573_MP3CFG  0x6B
+/* The ATAPI CDB bytes on their OWN short exchange. They are ALSO in the STATUS
+ * snapshot at words 12..23, but reading that far has never worked on hardware: a
+ * 24-word STATUS transaction comes back with words 10..23 zeroed AND it
+ * retroactively broke play_lba/play_endlba, which worked before the long read
+ * existed. The fabric serves all 23 words correctly (tb_s573_hps_ext walks every
+ * one); the framework drops io_enable part-way through a long transaction, so
+ * byte_cnt resets and the rest reads out shifted or zero. This therefore reads
+ * SHORTER rather than further -- 12 words at low indices, 13 exchanges against
+ * the 12 that already work. */
+#define CMD_573_CDB     0x6C
 
 /* DDR3 geometry -- must match the fabric. The DIO sample-RAM aperture is where
  * the game stages the SCRAMBLED stream; we only ever READ it. */
