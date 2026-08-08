@@ -264,7 +264,7 @@ static void ext_status(struct status_reply *st)
 //
 // Returns the fabric's cdb_count for that comparison.
 static uint16_t ext_cdb(struct status_reply *st, uint8_t page[14],
-                        uint16_t *sec_done, uint16_t *sec_abort)
+                        uint16_t *sec_done, uint16_t *sec_abort, uint16_t *gate)
 {
 	uint16_t cnt = spi_uio_cmd_cont(CMD_573_CDB);
 	for (int b = 0; b < 12; b += 2) {          // words 1..6: the newest CDB
@@ -279,6 +279,7 @@ static uint16_t ext_cdb(struct status_reply *st, uint8_t page[14],
 	}
 	*sec_done  = spi_w(0);          // word 14: sectors delivered to the CD-DA FIFO
 	*sec_abort = spi_w(0);          // word 15: sectors aborted by a data READ
+	*gate      = spi_w(0);          // word 16: the s573_cdda gate witness
 	DisableIO();
 	return cnt;
 }
@@ -618,10 +619,10 @@ void s573mp3_poll()
 		// two polls -- readable at any sample rate, unlike the ~30 ns req=/fetching= pulses
 		// this replaces. aborts should stay 0 on drmn: the game issues no data reads at all,
 		// so anything nonzero there is itself the finding.
-		static uint16_t sec_done = 0, sec_abort = 0;
+		static uint16_t sec_done = 0, sec_abort = 0, gate = 0;
 		int cdb_valid = 0;
 		if (cdb_trace_en) {
-			uint16_t cdb_snap_cnt = ext_cdb(&probe, page, &sec_done, &sec_abort);
+			uint16_t cdb_snap_cnt = ext_cdb(&probe, page, &sec_done, &sec_abort, &gate);
 			// Same instant? If the count moved between the two exchanges then these
 			// bytes describe a different command than the counters do. Mark it rather
 			// than print a pair that merely looks matched.
@@ -741,16 +742,33 @@ void s573mp3_poll()
 			else
 				sprintf(playstr, "%u..%u(lo16)", probe.play_lba, probe.play_end);
 
+			// The gate, rendered so the reading needs no decoder ring. req/ack are
+			// printed as DELTAS since the previous trace line -- they are wrapping
+			// 6-bit edge counts and an absolute is meaningless. The four flags are
+			// levels; the ones that are SET are the ones holding the gate shut.
+			static uint16_t gate_prev = 0; static int gate_seen = 0;
+			char gatestr[80]; {
+				unsigned r = gate & 0x3F, a = (gate >> 6) & 0x3F;
+				unsigned dr = gate_seen ? ((r - (gate_prev & 0x3F)) & 0x3F) : 0;
+				unsigned da = gate_seen ? ((a - ((gate_prev >> 6) & 0x3F)) & 0x3F) : 0;
+				snprintf(gatestr, sizeof gatestr, "req+%u ack+%u%s%s%s%s", dr, da,
+				         (gate & 0x1000) ? " PAUSED"   : "",
+				         (gate & 0x2000) ? " PLAYREQ"  : "",
+				         (gate & 0x4000) ? " PASTEND"  : "",
+				         (gate & 0x8000) ? " FIFOFULL" : "");
+				gate_prev = gate; gate_seen = 1;
+			}
+
 			printf("s573: cd flags=%04x  refused=%u playing=%u req=%u fetching=%u | "
 			       "cdbs=%u ops=%02x %02x %02x %02x | play_seen=%u op=%02x %s | "
-			       "aud spu=%u mp3=%u cdda=%u | sec=%u/%u | last=[%s]%s page0e=[%s]\n",
+			       "aud spu=%u mp3=%u cdda=%u | sec=%u/%u gate=[%s] | last=[%s]%s page0e=[%s]\n",
 			       probe.flags, !!(top & 0x8000), !!(top & 0x4000),
 			       !!(top & 0x2000), !!(top & 0x1000),
 			       probe.cdb_count,
 			       probe.cdb_ops[0], probe.cdb_ops[1], probe.cdb_ops[2], probe.cdb_ops[3],
 			       probe.play_seen, probe.play_op, playstr,
 			       probe.aud_spu, probe.aud_mp3, probe.aud_cdda,
-			       sec_done, sec_abort,
+			       sec_done, sec_abort, gatestr,
 			       // "(SKEW)" means the CDB exchange saw a different cdb_count than the
 			       // STATUS one -- the bytes and the counters describe different commands.
 			       // Never silently print such a pair as matched.
