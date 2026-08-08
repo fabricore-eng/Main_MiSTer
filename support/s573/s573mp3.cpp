@@ -661,16 +661,32 @@ void s573mp3_poll()
 		// A skipped count is REPORTED, never silently smoothed -- a sequence with an
 		// unmarked hole is worse than no sequence, because it reads as complete.
 		static int seq_en = -1;
-		if (seq_en < 0) seq_en = getenv("S573_CDB_SEQ") ? 1 : 0;
+		// Optional BOUNDED sink. Unset S573_CDB_SEQ_FILE keeps the original stdout
+		// behaviour exactly; set it and the log self-rotates at S573_CDB_SEQ_MAX_MB
+		// (default 48) so a long armed run cannot fill the board's 247 MB tmpfs. That
+		// is not hypothetical: measured ~17.4 MB/h on 2026-08-08, i.e. ~12.6 h to full,
+		// and the state being hunted only appears during long armed runs.
+		static s573_seq_sink_t seq_sink;
+		if (seq_en < 0) {
+			seq_en = getenv("S573_CDB_SEQ") ? 1 : 0;
+			if (seq_en) {
+				const char *sf = getenv("S573_CDB_SEQ_FILE");
+				const char *mb = getenv("S573_CDB_SEQ_MAX_MB");
+				uint64_t cap = mb ? (uint64_t)strtoull(mb, NULL, 10) * 1024ull * 1024ull : 0;
+				if (s573_seq_sink_open(&seq_sink, sf, cap) < 0)
+					printf("s573: seq log: cannot open '%s' -- falling back to stdout\n", sf);
+			}
+		}
 		if (seq_en && probe.flags != 0xFFFF && probe.cdb_count != s573.last_cdb_count) {
 			if (s573.seq_init) {
 				uint16_t gap = (uint16_t)(probe.cdb_count - s573.last_cdb_count);
-				if (gap > 1) printf("s573: seq GAP -- %u command(s) missed before #%u\n",
+				if (gap > 1) s573_seq_sink_printf(&seq_sink,
+				                    "s573: seq GAP -- %u command(s) missed before #%u\n",
 				                    gap - 1, probe.cdb_count);
 			}
 			char c0[40]; char *p = c0;
 			for (int b = 0; b < 12; b++) p += sprintf(p, "%02x ", st_cdb(&probe, 0, b));
-			printf("s573: seq #%-5u %s| play_seen=%u aud spu=%u cdda=%u\n",
+			s573_seq_sink_printf(&seq_sink, "s573: seq #%-5u %s| play_seen=%u aud spu=%u cdda=%u\n",
 			       probe.cdb_count, c0, probe.play_seen, probe.aud_spu, probe.aud_cdda);
 			s573.last_cdb_count = probe.cdb_count;
 			s573.seq_init = 1;

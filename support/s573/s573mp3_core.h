@@ -293,6 +293,40 @@ int s573_play_range(s573_play_latch_t *l, const uint8_t cdb[2][12],
                     int play_seen, uint16_t lo_lba, uint16_t lo_end,
                     uint32_t *out_lba, uint32_t *out_end);
 
+
+/* ---- bounded sink for the per-CDB sequence log ----------------------------
+ *
+ * WHY: S573_CDB_SEQ=1 emits one line per PACKET command, and DrumMania polls
+ * READ SUBCHANNEL continuously in attract, so the rate does NOT fall off when
+ * nothing is happening -- measured at ~17.4 MB/h on 2026-08-08. The board's
+ * /tmp is a 247 MB tmpfs on a machine with 492 MB of RAM, so an unattended run
+ * fills it in roughly half a day and the instrument deployed to catch the fault
+ * becomes the fault. That matters here more than usual: the state being hunted
+ * only shows up during long armed runs, so "just do not leave it on" is not an
+ * option.
+ *
+ * Two-file rotation rather than a cap-and-stop: the fault appears LATE, so the
+ * tail is the part worth keeping and truncating from the front is the whole
+ * point. Total on disk stays under 2*cap.
+ *
+ * State is caller-owned so the rotation can be driven by the host tests. With
+ * path == NULL the sink writes to stdout and never rotates, which is the
+ * original behaviour and stays the default. */
+typedef struct {
+    void     *f;            /* FILE* once open; NULL means "write to stdout" */
+    uint64_t  written;      /* bytes in the CURRENT file */
+    uint64_t  cap;          /* rotate once a line would push written past this */
+    unsigned  rotations;    /* diagnostic: how many times we have wrapped */
+    char      path[256];
+} s573_seq_sink_t;
+
+/* path == NULL (or "") -> stdout, unbounded, no rotation. cap_bytes == 0 picks
+ * the 48 MB default. Returns 0 on success, -1 if the file cannot be opened (in
+ * which case the sink falls back to stdout rather than losing the log). */
+int  s573_seq_sink_open(s573_seq_sink_t *s, const char *path, uint64_t cap_bytes);
+void s573_seq_sink_printf(s573_seq_sink_t *s, const char *fmt, ...);
+void s573_seq_sink_close(s573_seq_sink_t *s);
+
 #ifdef __cplusplus
 }
 #endif

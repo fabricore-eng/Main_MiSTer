@@ -316,3 +316,59 @@ int s573_play_range(s573_play_latch_t *l, const uint8_t cdb[2][12],
     return l->have && play_seen &&
            (uint16_t)l->lba == lo_lba && (uint16_t)l->end == lo_end;
 }
+
+/* ---- bounded sequence-log sink (see header for why) ---------------------- */
+#include <stdarg.h>
+#include <stdio.h>
+
+#define S573_SEQ_CAP_DEFAULT (48ull * 1024ull * 1024ull)
+
+int s573_seq_sink_open(s573_seq_sink_t *s, const char *path, uint64_t cap_bytes)
+{
+    zero(s, sizeof *s);
+    s->cap = cap_bytes ? cap_bytes : S573_SEQ_CAP_DEFAULT;
+    if (!path || !*path) return 0;                 /* stdout mode */
+    snprintf(s->path, sizeof s->path, "%s", path);
+    s->f = (void *)fopen(s->path, "w");
+    if (!s->f) { s->path[0] = 0; return -1; }      /* fall back to stdout */
+    setvbuf((FILE *)s->f, NULL, _IOLBF, 0);
+    return 0;
+}
+
+void s573_seq_sink_printf(s573_seq_sink_t *s, const char *fmt, ...)
+{
+    va_list ap;
+    char line[512];
+    int n;
+
+    va_start(ap, fmt);
+    n = vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if ((size_t)n >= sizeof line) n = (int)sizeof line - 1;
+
+    if (!s->f) { fwrite(line, 1, (size_t)n, stdout); return; }
+
+    /* Rotate BEFORE the write that would breach the cap, so the live file never
+     * exceeds it -- checking afterwards would let one line straddle the limit. */
+    if (s->written + (uint64_t)n > s->cap) {
+        char older[300];
+        fclose((FILE *)s->f);
+        snprintf(older, sizeof older, "%s.1", s->path);
+        remove(older);
+        rename(s->path, older);
+        s->f = (void *)fopen(s->path, "w");
+        if (!s->f) { s->path[0] = 0; fwrite(line, 1, (size_t)n, stdout); return; }
+        setvbuf((FILE *)s->f, NULL, _IOLBF, 0);
+        s->written = 0;
+        s->rotations++;
+    }
+    fwrite(line, 1, (size_t)n, (FILE *)s->f);
+    s->written += (uint64_t)n;
+}
+
+void s573_seq_sink_close(s573_seq_sink_t *s)
+{
+    if (s->f) fclose((FILE *)s->f);
+    s->f = NULL;
+}
