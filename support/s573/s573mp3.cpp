@@ -262,15 +262,19 @@ static void ext_status(struct status_reply *st)
 // starts lying, which is what this command exists to stop.
 //
 // Returns the fabric's cdb_count for that comparison.
-static uint16_t ext_cdb(struct status_reply *st)
+static uint16_t ext_cdb(struct status_reply *st, uint8_t page[14])
 {
 	uint16_t cnt = spi_uio_cmd_cont(CMD_573_CDB);
-	for (int c = 0; c < 2; c++)
-		for (int b = 0; b < 12; b += 2) {
-			uint16_t w = spi_w(0);
-			st->cdb[c][b]     = w & 0xFF;
-			st->cdb[c][b + 1] = w >> 8;
-		}
+	for (int b = 0; b < 12; b += 2) {          // words 1..6: the newest CDB
+		uint16_t w = spi_w(0);
+		st->cdb[0][b]     = w & 0xFF;
+		st->cdb[0][b + 1] = w >> 8;
+	}
+	for (int b = 0; b < 14; b += 2) {          // words 7..13: the CD Audio Control page
+		uint16_t w = spi_w(0);
+		page[b]     = w & 0xFF;
+		page[b + 1] = w >> 8;
+	}
 	DisableIO();
 	return cnt;
 }
@@ -601,9 +605,14 @@ void s573mp3_poll()
 		static int cdb_trace_en = -1;
 		if (cdb_trace_en < 0)
 			cdb_trace_en = (getenv("S573_CDB_SEQ") || getenv("S573_CDB_TRACE")) ? 1 : 0;
+		// The CD Audio Control page as the game last wrote it. Printed raw, all fourteen
+		// bytes, on purpose: bytes 6..13 are four (channel-select, volume) PAIRS, and
+		// build 4fc49129 muted the board by assuming the level lives in the first pair.
+		// Print the page and let the trace say which pair the game actually uses.
+		static uint8_t page[14];
 		int cdb_valid = 0;
 		if (cdb_trace_en) {
-			uint16_t cdb_snap_cnt = ext_cdb(&probe);
+			uint16_t cdb_snap_cnt = ext_cdb(&probe, page);
 			// Same instant? If the count moved between the two exchanges then these
 			// bytes describe a different command than the counters do. Mark it rather
 			// than print a pair that merely looks matched.
@@ -689,9 +698,16 @@ void s573mp3_poll()
 				char *p = cdbs[c];
 				for (int b = 0; b < 12; b++) p += sprintf(p, "%02x ", st_cdb(&probe, c, b));
 			}
+			// The CD Audio Control page, raw. Bytes 6..13 are four (select, volume)
+			// pairs; printing all of them is the whole point -- which pair the game
+			// actually drives is the open question, and guessing it muted the board once.
+			char pagestr[48]; {
+				char *p = pagestr;
+				for (int b = 0; b < 14; b++) p += sprintf(p, "%02x ", page[b]);
+			}
 			printf("s573: cd flags=%04x  refused=%u playing=%u req=%u fetching=%u | "
 			       "cdbs=%u ops=%02x %02x %02x %02x | play_seen=%u op=%02x %u..%u | "
-			       "aud spu=%u mp3=%u cdda=%u | last=[%s]%s prev=[%s]\n",
+			       "aud spu=%u mp3=%u cdda=%u | last=[%s]%s page0e=[%s]\n",
 			       probe.flags, !!(top & 0x8000), !!(top & 0x4000),
 			       !!(top & 0x2000), !!(top & 0x1000),
 			       probe.cdb_count,
@@ -701,7 +717,7 @@ void s573mp3_poll()
 			       // "(SKEW)" means the CDB exchange saw a different cdb_count than the
 			       // STATUS one -- the bytes and the counters describe different commands.
 			       // Never silently print such a pair as matched.
-			       cdbs[0], cdb_valid ? "" : "(SKEW)", cdbs[1]);
+			       cdbs[0], cdb_valid ? "" : "(SKEW)", pagestr);
 		}
 	}
 	/* 573 DIAGNOSTIC: re-send the cdinfo blob every ~8 s when S573_CDINFO_REPEAT is set,
