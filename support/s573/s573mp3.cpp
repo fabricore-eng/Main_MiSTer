@@ -180,9 +180,18 @@ struct status_reply {
 	uint8_t  cdb_ops[4];
 	uint8_t  play_seen, play_op;
 	uint16_t play_lba, play_end;
-	// Sticky per-source mixer activity {spu, mp3, cdda}: has each source ever driven
-	// a CHANGING sample. spu=0 means nothing is reaching the mixer at all, which
-	// makes every CD-DA reading moot -- that has to be ruled out first.
+	// Per-source mixer activity {spu, mp3, cdda}: did each source drive a CHANGING
+	// sample during the last ~62 ms window. Change, not non-zero -- a stuck DC level
+	// is silence that reads as signal. spu=0 means nothing is reaching the mixer at
+	// all, which makes every CD-DA reading moot; rule that out first.
+	//
+	// THESE USED TO BE STICKY SINCE RESET, and reading them as "is this playing now"
+	// was wrong in a way that wasted hours on 2026-08-07: cdda=1 was quoted as proof
+	// that CD audio was live during a stage when all it meant was that it had moved
+	// once, much earlier. The fabric now publishes a windowed verdict instead
+	// (emu.sv, s573_mister-dev afc98b8). Against an OLDER .rbf these fields still
+	// latch forever -- so before trusting a 0->1->0 transition, confirm the core is
+	// afc98b8 or later, otherwise a constant 1 means nothing.
 	uint8_t  aud_spu, aud_mp3, aud_cdda;
 	// The two newest COMPLETE CDBs. Opcodes alone got as far as "DrumMania loops
 	// MODE SELECT(10) and READ SUBCHANNEL and never plays"; which mode page it is
