@@ -662,20 +662,31 @@ void s573mp3_poll()
 		// A skipped count is REPORTED, never silently smoothed -- a sequence with an
 		// unmarked hole is worse than no sequence, because it reads as complete.
 		static int seq_en = -1;
-		// Optional BOUNDED sink. Unset S573_CDB_SEQ_FILE keeps the original stdout
-		// behaviour exactly; set it and the log self-rotates at S573_CDB_SEQ_MAX_MB
-		// (default 48) so a long armed run cannot fill the board's 247 MB tmpfs. That
-		// is not hypothetical: measured ~17.4 MB/h on 2026-08-08, i.e. ~12.6 h to full,
-		// and the state being hunted only appears during long armed runs.
+		// BOUNDED sink, and bounded BY DEFAULT since 2026-08-09. The log self-rotates
+		// at S573_CDB_SEQ_MAX_MB (default 48) into S573_CDB_SEQ_FILE, and with that
+		// variable unset the path defaults to the capped file rather than to stdout,
+		// so merely arming the instrument can no longer fill the board's 247 MB tmpfs.
+		// That is not hypothetical twice over: ~17.4 MB/h measured 2026-08-08 (~12.6 h
+		// to full), and on 2026-08-09 a session armed S573_CDB_SEQ=1 with no file and
+		// hand-redirected stdout -- the exact unbounded path. Unbounded stdout is still
+		// available as S573_CDB_SEQ_FILE=- for a short attended run.
+		// Where the log went is ANNOUNCED on stdout: silently relocating output that a
+		// caller expects to see on the console would be its own trap.
 		static s573_seq_sink_t seq_sink;
 		if (seq_en < 0) {
 			seq_en = getenv("S573_CDB_SEQ") ? 1 : 0;
 			if (seq_en) {
-				const char *sf = getenv("S573_CDB_SEQ_FILE");
+				const char *sf = s573_seq_sink_default_path(getenv("S573_CDB_SEQ_FILE"));
 				const char *mb = getenv("S573_CDB_SEQ_MAX_MB");
 				uint64_t cap = mb ? (uint64_t)strtoull(mb, NULL, 10) * 1024ull * 1024ull : 0;
 				if (s573_seq_sink_open(&seq_sink, sf, cap) < 0)
 					printf("s573: seq log: cannot open '%s' -- falling back to stdout\n", sf);
+				else if (sf)
+					printf("s573: seq log -> %s (cap %llu MB, rotates to %s.1)\n",
+					       sf, (unsigned long long)(seq_sink.cap / (1024ull * 1024ull)), sf);
+				else
+					printf("s573: seq log -> stdout, UNBOUNDED (S573_CDB_SEQ_FILE=-); "
+					       "unset it for the capped %s\n", S573_SEQ_PATH_DEFAULT);
 			}
 		}
 		if (seq_en && probe.flags != 0xFFFF && probe.cdb_count != s573.last_cdb_count) {

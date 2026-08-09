@@ -85,7 +85,8 @@ int main(void)
         "oldest line still in the live file after rotation");
 
     /* 6. stdout mode (path NULL) must not rotate or touch the filesystem --
-     *    that is the pre-existing behaviour and the default. */
+     *    still reachable, but from 2026-08-09 only when the caller ASKS for it
+     *    by name (see 8); it is no longer what an unset environment selects. */
     {
         s573_seq_sink_t d;
         CHK(s573_seq_sink_open(&d, NULL, 0) == 0, "stdout-mode open failed");
@@ -102,6 +103,43 @@ int main(void)
         CHK(d.f == NULL, "bad path left a file handle");
         s573_seq_sink_printf(&d, "");       /* must not crash */
         s573_seq_sink_close(&d);
+    }
+
+    /* 8. THE SAFETY DEFAULT. Everything above only bounds the log once a caller
+     *    passes a path; with S573_CDB_SEQ_FILE unset the sink used to fall back
+     *    to UNBOUNDED stdout, so "armed" still meant "can fill /tmp". Measured
+     *    2026-08-09: a session armed the instrument with S573_CDB_SEQ=1 alone
+     *    and redirected stdout by hand -- exactly the unbounded path. So the
+     *    resolver, not the caller, decides: unset/empty picks the capped file,
+     *    and unbounded stdout has to be spelled out as "-". */
+    {
+        const char *d_unset = s573_seq_sink_default_path(NULL);
+        const char *d_empty = s573_seq_sink_default_path("");
+        const char *d_dash  = s573_seq_sink_default_path("-");
+        const char *d_named = s573_seq_sink_default_path("/tmp/mine.log");
+
+        CHK(d_unset != NULL, "unset S573_CDB_SEQ_FILE still selects unbounded stdout");
+        CHK(d_empty != NULL, "empty S573_CDB_SEQ_FILE still selects unbounded stdout");
+        CHK(d_unset && d_empty && !strcmp(d_unset, d_empty),
+            "unset and empty disagree on the default path");
+        CHK(d_dash == NULL, "\"-\" did not select stdout");
+        CHK(d_named && !strcmp(d_named, "/tmp/mine.log"),
+            "an explicit path was not passed through");
+
+        /* And the default must really be usable as a bounded sink, not just a
+         * non-NULL string: open it and confirm a file handle plus a live cap. */
+        if (d_unset) {
+            s573_seq_sink_t d;
+            char d_older[300];
+            CHK(s573_seq_sink_open(&d, d_unset, 0) == 0,
+                "default path %s could not be opened", d_unset);
+            CHK(d.f != NULL, "default path did not open a file");
+            CHK(d.cap > 0, "default sink has no cap");
+            s573_seq_sink_printf(&d, "hello\n");
+            s573_seq_sink_close(&d);
+            snprintf(d_older, sizeof d_older, "%s.1", d_unset);
+            remove(d_unset); remove(d_older);
+        }
     }
 
     remove(path); remove(older);

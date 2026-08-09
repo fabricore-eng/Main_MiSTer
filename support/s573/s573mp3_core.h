@@ -310,8 +310,14 @@ int s573_play_range(s573_play_latch_t *l, const uint8_t cdb[2][12],
  * point. Total on disk stays under 2*cap.
  *
  * State is caller-owned so the rotation can be driven by the host tests. With
- * path == NULL the sink writes to stdout and never rotates, which is the
- * original behaviour and stays the default. */
+ * path == NULL the sink writes to stdout and never rotates.
+ *
+ * WHICH MODE AN ARMED RUN GETS is decided by s573_seq_sink_default_path() below,
+ * NOT by this call. Until 2026-08-09 an unset S573_CDB_SEQ_FILE meant stdout,
+ * so the cap only protected the board when someone remembered to name a file --
+ * and on 2026-08-09 a session armed the instrument with S573_CDB_SEQ=1 alone and
+ * redirected stdout by hand, which is precisely the unbounded case this exists to
+ * prevent. A safety default that has to be opted into is not a safety default. */
 typedef struct {
     void     *f;            /* FILE* once open; NULL means "write to stdout" */
     uint64_t  written;      /* bytes in the CURRENT file */
@@ -324,6 +330,20 @@ typedef struct {
  * the 48 MB default. Returns 0 on success, -1 if the file cannot be opened (in
  * which case the sink falls back to stdout rather than losing the log). */
 int  s573_seq_sink_open(s573_seq_sink_t *s, const char *path, uint64_t cap_bytes);
+
+/* Resolve S573_CDB_SEQ_FILE (pass getenv()'s result, NULL included) to the path
+ * s573_seq_sink_open() should be given:
+ *
+ *   NULL or ""  -> S573_SEQ_PATH_DEFAULT, the CAPPED file. Arming the instrument
+ *                  is now bounded by default; nothing has to be remembered.
+ *   "-"         -> NULL, i.e. unbounded stdout. Still available for a short
+ *                  attended run, but it has to be asked for by name.
+ *   anything    -> itself, unchanged.
+ *
+ * Returns a pointer the caller does not own (a literal or the argument itself).
+ * Split out of the SPI poll so the policy is testable without a board. */
+const char *s573_seq_sink_default_path(const char *env_file);
+#define S573_SEQ_PATH_DEFAULT "/tmp/s573_seq.log"
 void s573_seq_sink_printf(s573_seq_sink_t *s, const char *fmt, ...);
 void s573_seq_sink_close(s573_seq_sink_t *s);
 

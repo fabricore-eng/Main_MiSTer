@@ -323,6 +323,15 @@ int s573_play_range(s573_play_latch_t *l, const uint8_t cdb[2][12],
 
 #define S573_SEQ_CAP_DEFAULT (48ull * 1024ull * 1024ull)
 
+const char *s573_seq_sink_default_path(const char *env_file)
+{
+    if (!env_file || !*env_file) return S573_SEQ_PATH_DEFAULT;
+    /* "-" is the conventional spelling for "the standard stream", and unlike ""
+     * or "stdout" it cannot be mistaken for a path someone meant to write to. */
+    if (env_file[0] == '-' && env_file[1] == 0) return NULL;
+    return env_file;
+}
+
 int s573_seq_sink_open(s573_seq_sink_t *s, const char *path, uint64_t cap_bytes)
 {
     zero(s, sizeof *s);
