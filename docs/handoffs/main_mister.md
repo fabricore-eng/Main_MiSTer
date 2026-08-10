@@ -1,80 +1,64 @@
-# Handoff — Main fork (573 work) — 2026-08-06 21:15
-Branch: `claude/system573-framework-refresh-115qgm`   ·   Repo: `fabricore-eng/main_mister`
+# Handoff — main_mister — 2026-08-10 22:20 UTC
+Branch: `claude/system573-cd-titles-test-je3lrq`   ·   Repo: `fabricore-eng/main_mister`
+
+> This is the **fork**, not MiSTer-devel upstream. Everything here exists to serve the 573 lane.
+> Read that lane's handoff first: `docs/handoffs/573.md` in `fabricore-eng/system573_mister-dev`.
 
 ## TL;DR
-
-This fork exists to serve the **573** core; it is not an independent lane and has no charter
-of its own. **The entry point for this work is `docs/handoffs/573.md` in
-`fabricore-eng/System573_MiSTer-dev` (branch `claude/system573-framework-refresh-115qgm`)** —
-read that first. This file records only what is true on the Main side.
-
-## Current branches (all three repos in play)
-
-| Repo | Branch | Head |
-|---|---|---|
-| `fabricore-eng/main_mister` | `claude/system573-framework-refresh-115qgm` | `950d99d` |
-| `fabricore-eng/System573_MiSTer-dev` | `claude/system573-framework-refresh-115qgm` | see that repo |
-| `fabricore-eng/fabricore` | `claude/system573-framework-refresh-csj49s` | workspace root |
+Tree is clean and everything is pushed; nothing was changed here this session. Two earlier
+changes on this branch are load-bearing for 573 and both are already **live on the board**.
 
 ## State of play
-
-- **Done, deployed and md5-verified on the board:** `19f99c5`, built to md5
-  `4163616fd59adcca0d60359523d40c31`, matches `/media/fat/MiSTer`. It reads the core's ATAPI
-  CDB trace out of `CMD_573_STATUS` and reports it. That instrument produced the session's
-  only real reading (see the 573 doc).
-- **Built but NOT deployed:** `950d99d`, md5 `e5feafb6e38fd2c7d9e543383629501a`, sitting on
-  dell at `/home/human/Main_MiSTer/bin/MiSTer`. It reads STATUS words 12..23 (the two newest
-  whole 12-byte CDBs) and filters torn reads. **Deploy it together with the core build
-  `c1b9ac0`, not before** — a new Main against the old core clocks 12 words the fabric does
-  not serve.
-- **Earlier this session, already on the board and verified:** the `<disc>` → PSX CD mount
-  route, `role=`-based multi-disc selection, `kMaxImages` 4→8, and flash-save seeding so a
-  first install sticks.
+- **Done — the pregap fix** (`f10ab64`, correcting `e32f702`). `support/psx/psx.cpp`
+  `load_chd()` double-counted a pregap that a CHD does not store, putting every track from the
+  third onward **+150 frames = 2.000 s** late. The first attempt used each track's *own*
+  preceding gap, which would have broken DrumMania; modelling both discs caught it
+  (ddrjb 26/28→0/28, drmn 0/69→**26+/69 regression**) and the corrected version spans the gap
+  **AFTER** each track (drmn back to 0/69). Deployed; the operator confirmed the charts are in
+  sync.
+- **Done — the CDB sequence log is bounded by DEFAULT** (`680dfda`, then `3a59ef7`). Armed with
+  `S573_CDB_SEQ=1` and no file set, it writes a self-rotating capped file instead of streaming
+  to stdout forever. **Verified in production**, not just in code: on the board right now
+  `/tmp/s573_seq.log` is 35 MB with a rotated `.1` at 48 MB — it hit the cap and rotated.
+  Steady-state ceiling ≈96 MB = **39% of the 247 MB tmpfs**, under the 60% action line. The
+  instrument is safe to leave armed.
+- **In progress:** nothing.
+- **Blocked:** nothing here. (`main` being behind is a 573-lane trunk-hygiene question.)
 
 ## Key decisions (and why)
-
-- **`ext_status()` reads a widening reply, and that is deliberately backward-compatible.**
-  The fabric serves words 1..23 from the same snapshot bank; an older Main simply drops
-  `io_enable` early and never clocks the trace words. Do not turn this into a second SPI
-  exchange — one snapshot is what makes count, opcodes and CDBs a single consistent reading.
-- **The torn-read guard is a FILTER, not a fix.** It drops a reply only when the trace tail
-  is all-zero AND a non-zero trace has already been seen, so a genuine post-reset zero still
-  reports, and it counts what it drops. If that count is large the fabric mailbox needs a
-  look — see the 573 doc's *Open questions*.
-- **Deploy the `.rbf` to BOTH board paths.** `.mgl` launchers load from `_Console/`, `.mra`
-  ones from `_Arcade/cores/`. `/tmp/deploy_and_probe.sh` on dell does both.
+- **Gap AFTER, not the track's own gap.** Both readings fit `ddrjb`; only one fits DrumMania.
+  Whenever this is touched again, model at least those two discs before believing a fix.
+- **The log cap is the default, not an opt-in.** An instrument that can fill a 247 MB tmpfs on a
+  492 MB board turns itself into the fault. `S573_CDB_SEQ_FILE=-` still gives unbounded stdout
+  for a short attended run.
 
 ## Refuted — do not re-derive
-
-- **`get_rbf_name()` as the basis for `is_573()`** — it returns the `.mra` path on an arcade
-  launch, so the test was false for the entire arcade route (and silently killed MP3 audio
-  for 71 titles). Replaced with CONF_STR matching. Built, deployed, measured wrong.
-- **Positional multi-disc selection** — wrong for the 3 sets that list the install disc
-  second and meaningless for the 7 with no install disc. MAME's `region=` is authoritative.
-- **Arming the empty flash slot at mount** — froze boot at `START UP...`, A/B verified.
-  The correct fix was seeding the `.sav` from the `<rom index=2>` preload.
+- **"`PreGap: 0` in the board log proves the pregap theory wrong."** It does not — that log line
+  prints a local that `mister_chd.cpp:112` zeroes four lines before the print at `:157`. A bad
+  measurement killed the correct hypothesis for a while; round two reversed it.
 
 ## Next steps
+1. Nothing required in this repo. Any further work here will come from the 573 lane — most
+   likely `A2` from the flash-window investigation: stop skipping the 573 flash storage slot in
+   `support/arcade/mra_loader.cpp:1513` when the `.mra` declares no index-2 preload. That is
+   belt-and-braces only; the generator-side fix (already committed in the 573 lane) should make
+   it unnecessary.
+   **Verify:** if attempted, rebuild and copy Main to the card — no Quartus build needed — and
+   confirm a cold `ddra` still reaches the install prompt.
 
-1. Wait for core build `c1b9ac0`, then deploy this fork's `950d99d` **and** that `.rbf`
-   in one pass: `ssh dell 'bash /tmp/deploy_and_probe.sh'`.
-   **Verify with:** `md5sum /media/fat/MiSTer` on the board = `e5feafb6e38fd2c7d9e543383629501a`,
-   and the trace line printing `last=[…] prev=[…]` with twelve hex bytes each.
-2. Everything after that is a 573-side question. Follow that lane's doc.
+## Hardware state
+- **MiSTer binary on the board:** md5 `4ac28e743a8774a130ccdca2a8b656ce`, 1,100,540 B,
+  2026-08-10 06:58. Believed built from `f10ab64`; `3a59ef7` is an ancestor, and the observed
+  log rotation confirms the cap is in it.
+- **18 MiSTer binaries are kept on the board and every one is a distinct build — do not prune.**
 
 ## Landmarks
-
-- `support/s573/s573mp3.cpp:191` — `ext_status()`, the 23-word STATUS read.
-- `support/s573/s573mp3.cpp:538` — the torn-read guard and its counter.
-- `support/s573/s573mp3.cpp:586` — the trace report line.
-- `support/arcade/mra_loader.cpp:363` — flash-save seeding from the factory preload.
-- `support/arcade/mra_loader.cpp:1539` — the PSX CD dispatch for `<disc>`.
-- `support/psx/psx.cpp:754` — `psx_mount_cd_media()`, the console-convention-free sibling
-  of `psx_mount_cd()` (no BIOS, no game id, no region probe, no memory card).
+- `support/psx/psx.cpp` — `load_chd()`, `gap_after[]`
+- `support/s573/s573mp3.cpp:654-690` — the bounded sequence log and its env gates
+- `support/arcade/mra_loader.cpp:1513` — the skipped storage slot behind the 573 flash bug
+- `support/arcade/mra_loader.cpp:363,396` — `s573_seed_flash_save`, which creates the `.sav`
+  from an index-2 preload
 
 ## Open questions / risks
-
-- The build toolchain here is `mister-arm:10.2` on dell via docker; `make` outputs
-  `bin/MiSTer`, and `scp` onto a running `/media/fat/MiSTer` fails `ETXTBSY` — copy to a temp
-  name and `mv`.
-- The board has no `pkill`; kill MiSTer by PID from `ps w`.
+- The exact commit the deployed binary was built from is **inferred**, not recorded. If that
+  ever matters, rebuild and redeploy rather than trusting the inference.
