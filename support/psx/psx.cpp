@@ -138,41 +138,59 @@ static int load_chd(const char *filename, toc_t *table)
 	* pregap, unlike some other cores. Adjust the CHD toc to reflect this
 	*/
 
-	/* Was each track's pregap PHYSICALLY PRESENT in the image?
+	/* How many frames physically separate this track's end from the NEXT track's start?
 	 *
-	 * This has to be answered BEFORE the loop below, because the loop overwrites
-	 * tracks[i-1].end and the answer is the gap between consecutive tracks as
-	 * mister_chd left them:
+	 * The repack below makes tracks contiguous: start[i] = end[i-1] + 1. So each track's
+	 * published length has to span everything between its own start and the next track's
+	 * start -- its audio PLUS any gap that physically follows it. Get that wrong and the
+	 * error accumulates into every later track for the rest of the disc.
+	 *
+	 * The gap after track i is start[i+1] - end[i] as mister_chd left them:
 	 *
 	 *   PGTYPE starts with 'V' (gap IS in the image): mister_chd.cpp:88-96 sets
-	 *       tracks[i].start = tracks[i-1].end + pregap   ->  difference == indexes[1]
+	 *       tracks[i+1].start = tracks[i].end + pregap    ->  gap == pregap
 	 *   PGTYPE without 'V' (a cue PREGAP command; gap NOT in the image):
-	 *       mister_chd.cpp:86-89 has ALREADY charged those frames to the previous
-	 *       track's end, then sets tracks[i].start = tracks[i-1].end
-	 *                                                 ->  difference == 0
+	 *       mister_chd.cpp:86-89 has ALREADY charged those frames to track i's end,
+	 *       then sets tracks[i+1].start = tracks[i].end   ->  gap == 0
 	 *
-	 * indexes[1] is 150 in BOTH cases (mister_chd.cpp:97 records it before
-	 * mister_chd.cpp:112 zeroes the local `pregap`), so it cannot be used to tell
-	 * them apart -- and using it was the bug: for a non-stored pregap the 150 frames
-	 * got counted twice, once by mister_chd into the previous track and again here,
-	 * pushing every later track 150 frames (2.000 s) late for the whole disc.
+	 * It must be computed BEFORE the loop, which overwrites end[i].
 	 *
-	 * MEASURED on ddrjb's 845jab02.chd, which has exactly one non-stored pregap
-	 * (chdman info -v: TRACK:2 TYPE:AUDIO FRAMES:1287 PREGAP:150 PGTYPE:MODE1):
-	 * MAME 0.285 on the same CHD publishes track starts 0/928/2215/6836/12519/14320
-	 * and lead-out 124625; before this fix we published 0/928/2365/6986/12669/14470
-	 * and lead-out 124775 -- every track from the third onward exactly +150. The
-	 * System 573 core plays from those TOC values, so its CD audio began 2.000 s
-	 * into every song while the game's arrow chart started at zero.
+	 * THE BUG THIS REPLACES: the old code added tracks[i].indexes[1] -- the track's OWN
+	 * pregap. indexes[1] is 150 in both cases above (mister_chd.cpp:97 records it before
+	 * :112 zeroes the local `pregap`), so it cannot distinguish them, and it is the wrong
+	 * gap besides: a track's own pregap sits BEFORE it, not after. On a disc whose gaps
+	 * are all stored the two happen to coincide and the old code is correct; on a disc
+	 * with a non-stored pregap those 150 frames get counted twice -- once by mister_chd
+	 * into the previous track, again here -- and every later track lands 2.000 s late.
 	 *
-	 * Do not "simplify" this back to indexes[1]. The board's own "PreGap: 0" log line
-	 * is NOT evidence that a disc has no pregap: mister_chd.cpp:157 prints the local
-	 * that :112 has already zeroed for exactly the non-stored case this guards.
+	 * MEASURED, on both discs this core actually runs, modelling old vs new against their
+	 * real chdman metadata and checking every published start against mister_chd's own
+	 * INDEX 01 (which round-2 verified is byte-identical to MAME 0.285's):
+	 *
+	 *   ddrjb 845jab02.chd  (1 non-stored pregap, 27 tracks with none)
+	 *        old: 26/28 tracks wrong, first at track 3 -> 2365 where MAME says 2215
+	 *        new:  0/28
+	 *   drmn  881xxb02.chd  (1 non-stored pregap, then 67 STORED 'VAUDIO' pregaps)
+	 *        old:  0/69      new: 0/69      <- unchanged, no regression
+	 *
+	 * That second row is the reason this is start[i+1]-end[i] and not start[i]-end[i-1]:
+	 * the latter also fixes ddrjb but shifts every drummania track 150 frames EARLY,
+	 * because there each track's stored pregap is exactly the gap the previous track
+	 * must span.
+	 *
+	 * Consequence on System 573, which is what surfaced it: the core plays songs from
+	 * these TOC values, so CD audio began 2.000 s into every ddrjb song while the game's
+	 * arrow chart started at zero. The 150 skipped frames are 150/150 non-silent.
+	 *
+	 * Do not "simplify" this back to indexes[1]. And note the board's "PreGap: 0" log is
+	 * NOT evidence a disc has no pregap: mister_chd.cpp:157 prints the local that :112
+	 * has already zeroed, for exactly the non-stored case this guards.
 	 */
-	int pg_in_image[100];
-	pg_in_image[0] = 0;
-	for (int i = 1; i < table->last && i < 100; i++)
-		pg_in_image[i] = table->tracks[i].start - table->tracks[i-1].end;
+	int gap_after[100];
+	for (int i = 0; i < table->last && i < 100; i++)
+		gap_after[i] = (i + 1 < table->last)
+		             ? (table->tracks[i+1].start - table->tracks[i].end)   // 0 if folded, pregap if stored
+		             : 0;                                                 // nothing follows the last track
 
 	for (int i = 0; i < table->last; i++)
 	{
@@ -183,7 +201,7 @@ static int load_chd(const char *filename, toc_t *table)
 			table->tracks[i].end += 150-1;
 		} else {
 			int frame_cnt = table->tracks[i].end - table->tracks[i].start;
-			frame_cnt += pg_in_image[i];
+			frame_cnt += gap_after[i];
 			table->tracks[i].start = table->tracks[i-1].end + 1;
 			table->tracks[i].end = table->tracks[i].start + frame_cnt - 1;
 		}
