@@ -138,6 +138,42 @@ static int load_chd(const char *filename, toc_t *table)
 	* pregap, unlike some other cores. Adjust the CHD toc to reflect this
 	*/
 
+	/* Was each track's pregap PHYSICALLY PRESENT in the image?
+	 *
+	 * This has to be answered BEFORE the loop below, because the loop overwrites
+	 * tracks[i-1].end and the answer is the gap between consecutive tracks as
+	 * mister_chd left them:
+	 *
+	 *   PGTYPE starts with 'V' (gap IS in the image): mister_chd.cpp:88-96 sets
+	 *       tracks[i].start = tracks[i-1].end + pregap   ->  difference == indexes[1]
+	 *   PGTYPE without 'V' (a cue PREGAP command; gap NOT in the image):
+	 *       mister_chd.cpp:86-89 has ALREADY charged those frames to the previous
+	 *       track's end, then sets tracks[i].start = tracks[i-1].end
+	 *                                                 ->  difference == 0
+	 *
+	 * indexes[1] is 150 in BOTH cases (mister_chd.cpp:97 records it before
+	 * mister_chd.cpp:112 zeroes the local `pregap`), so it cannot be used to tell
+	 * them apart -- and using it was the bug: for a non-stored pregap the 150 frames
+	 * got counted twice, once by mister_chd into the previous track and again here,
+	 * pushing every later track 150 frames (2.000 s) late for the whole disc.
+	 *
+	 * MEASURED on ddrjb's 845jab02.chd, which has exactly one non-stored pregap
+	 * (chdman info -v: TRACK:2 TYPE:AUDIO FRAMES:1287 PREGAP:150 PGTYPE:MODE1):
+	 * MAME 0.285 on the same CHD publishes track starts 0/928/2215/6836/12519/14320
+	 * and lead-out 124625; before this fix we published 0/928/2365/6986/12669/14470
+	 * and lead-out 124775 -- every track from the third onward exactly +150. The
+	 * System 573 core plays from those TOC values, so its CD audio began 2.000 s
+	 * into every song while the game's arrow chart started at zero.
+	 *
+	 * Do not "simplify" this back to indexes[1]. The board's own "PreGap: 0" log line
+	 * is NOT evidence that a disc has no pregap: mister_chd.cpp:157 prints the local
+	 * that :112 has already zeroed for exactly the non-stored case this guards.
+	 */
+	int pg_in_image[100];
+	pg_in_image[0] = 0;
+	for (int i = 1; i < table->last && i < 100; i++)
+		pg_in_image[i] = table->tracks[i].start - table->tracks[i-1].end;
+
 	for (int i = 0; i < table->last; i++)
 	{
 		if (i == 0) //First track fakes a pregap even if it doesn't exist
@@ -147,7 +183,7 @@ static int load_chd(const char *filename, toc_t *table)
 			table->tracks[i].end += 150-1;
 		} else {
 			int frame_cnt = table->tracks[i].end - table->tracks[i].start;
-			frame_cnt += table->tracks[i].indexes[1];
+			frame_cnt += pg_in_image[i];
 			table->tracks[i].start = table->tracks[i-1].end + 1;
 			table->tracks[i].end = table->tracks[i].start + frame_cnt - 1;
 		}
